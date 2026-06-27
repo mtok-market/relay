@@ -73,7 +73,10 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, fetchImpl 
           && topicToAddress(l.topics[2]) === want,
       );
       if (!log) return { ok: false, reason: 'no_matching_usdc_transfer' };
-      const amount = BigInt(log.data);
+      // A malformed/non-hex log.data must fail CLOSED, not throw — the verifier contract
+      // is "never throws, returns {ok:false}" (a throw here would propagate out of reportChunk).
+      let amount;
+      try { amount = BigInt(log.data); } catch { return { ok: false, reason: 'malformed_transfer_log' }; }
       if (amount < BigInt(minAtomic)) return { ok: false, reason: 'amount_too_low' };
       return { ok: true, from: topicToAddress(log.topics[1]), amount: amount.toString() };
     },
