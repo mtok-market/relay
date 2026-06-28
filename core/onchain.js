@@ -19,7 +19,7 @@ export const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11
 const topicToAddress = (topic) => '0x' + String(topic).slice(-40).toLowerCase();
 const lc = (a) => String(a || '').toLowerCase();
 
-export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, fetchImpl = globalThis.fetch,
+export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedChainId, fetchImpl = globalThis.fetch,
   // A just-submitted payment can be mined on the payer's RPC yet not YET indexed by
   // ours (cross-RPC propagation lag), so a single receipt lookup returns null and the
   // chunk/settlement is wrongly rejected as tx_not_found_or_pending. Retry the receipt
@@ -50,6 +50,22 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, fetchImpl 
     throw lastErr ?? apiError(502, 'rpc_error', 'no chain RPC configured');
   }
 
+  // #287: confirm the RPC pool is on the EXPECTED chain before trusting any receipt.
+  // Without this, a misconfigured / wrong-chain RPC (or a fallback answering for another
+  // chain) could validate a worthless transfer at the same USDC address on a cheap chain
+  // as if it were real Base-mainnet USDC. Cache only a SUCCESS, so a transient first-call
+  // failure doesn't permanently wedge verification.
+  let chainConfirmed = false;
+  async function assertChain() {
+    if (expectedChainId == null) return true; // no expected chain configured -> today's behavior
+    if (chainConfirmed) return true;
+    try {
+      const hex = await rpc('eth_chainId', []);
+      if (typeof hex === 'string' && parseInt(hex, 16) === Number(expectedChainId)) { chainConfirmed = true; return true; }
+      return false; // wrong chain (don't cache -- config might be corrected)
+    } catch { return false; } // transient -- don't cache, retry next call
+  }
+
   return {
     configured,
 
@@ -57,6 +73,9 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, fetchImpl 
     // Returns { ok, reason?, from?, amount? }; never throws on a bad payment
     // (only on an RPC transport failure).
     async verifyTransfer(txHash, { to, minAtomic }) {
+      // #287: never trust a receipt from a wrong-chain RPC (a misconfigured / fallback
+      // RPC answering for another chain could otherwise validate a worthless transfer).
+      if (!(await assertChain())) return { ok: false, reason: 'wrong_chain' };
       let receipt = await rpc('eth_getTransactionReceipt', [txHash]);
       // Retry on a null receipt only — a fresh tx may not be indexed by our RPC yet.
       // A failed/wrong tx returns a non-null receipt and is judged immediately below.
