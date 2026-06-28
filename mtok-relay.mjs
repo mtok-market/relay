@@ -153,6 +153,10 @@ async function handleFund(body, res) {
 async function handleDraw(body, res) {
   const { bookingId, n, buyerId, request } = body;
   if (!bookingId) return send(res, 400, { error: 'bad_request', detail: 'DRAW needs bookingId' });
+  // #289: the platform requires a per-booking delivery index `n` (idempotency key) and
+  // rejects a DRAW without it. Fail fast HERE — before spending a real upstream call —
+  // so a client that omits n doesn't cost the seller an unmetered, unpaid inference.
+  if (n == null) return send(res, 400, { error: 'bad_request', detail: 'DRAW needs a delivery index n (per-booking idempotency key)' });
 
   // Step 1: read the booking balance; refuse to spend inference if exhausted (402).
   let booking;

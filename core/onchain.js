@@ -56,12 +56,17 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
   // as if it were real Base-mainnet USDC. Cache only a SUCCESS, so a transient first-call
   // failure doesn't permanently wedge verification.
   let chainConfirmed = false;
+  // #289: coerce up front so an empty/garbage chain id means "no pin" (skip the check),
+  // NOT "expected chain 0" -- the latter would brick EVERY verification (no chain reports
+  // id 0). Only a positive finite chain id activates the pin.
+  const expChain = Number(expectedChainId);
+  const chainPinned = Number.isFinite(expChain) && expChain > 0;
   async function assertChain() {
-    if (expectedChainId == null) return true; // no expected chain configured -> today's behavior
+    if (!chainPinned) return true; // no (valid) expected chain configured -> today's behavior
     if (chainConfirmed) return true;
     try {
       const hex = await rpc('eth_chainId', []);
-      if (typeof hex === 'string' && parseInt(hex, 16) === Number(expectedChainId)) { chainConfirmed = true; return true; }
+      if (typeof hex === 'string' && parseInt(hex, 16) === expChain) { chainConfirmed = true; return true; }
       return false; // wrong chain (don't cache -- config might be corrected)
     } catch { return false; } // transient -- don't cache, retry next call
   }
