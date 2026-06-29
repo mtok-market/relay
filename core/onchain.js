@@ -89,6 +89,10 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
         receipt = await rpc('eth_getTransactionReceipt', [txHash]);
       }
       if (!receipt) return { ok: false, reason: 'tx_not_found_or_pending' };
+      // #308: bind the receipt to the tx we asked about. We trust this receipt's logs to credit
+      // money, so a caching/coalescing/lying RPC that returns ANOTHER tx's (real) receipt for our
+      // hash must not pass. eth_getTransactionReceipt echoes the tx hash; require it to match.
+      if (lc(receipt.transactionHash) !== lc(txHash)) return { ok: false, reason: 'receipt_tx_mismatch' };
       if (receipt.status !== '0x1') return { ok: false, reason: 'tx_failed' };
       const want = lc(to);
       const log = (receipt.logs || []).find(
