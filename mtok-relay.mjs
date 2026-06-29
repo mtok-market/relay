@@ -23,7 +23,7 @@
 // All secrets are read from env, never argv.
 
 import http from 'node:http';
-import { enforceModelEcho, buildFundReport, buildDrawReport } from './lib.mjs';
+import { enforceModelEcho, buildFundReport, buildDrawReport, requiresFeeLeg } from './lib.mjs';
 import { privateKeyToAccount } from 'viem/accounts';
 import { createOnchainVerifier, usdToAtomic } from './core/onchain.js';
 
@@ -96,13 +96,14 @@ function send(res, status, body) {
 }
 
 // ---- boot: fetch platform config + build the read-only on-chain verifier ----
-let feeAddress, feeBps, verifier;
+let feeAddress, feeBps, dustThresholdUsd, verifier;
 async function boot() {
   const r = await fetch(apiBase + '/api/config');
   if (!r.ok) throw new Error('config fetch failed: ' + r.status);
   const config = await r.json();
   feeAddress = config.feeAddress;
   feeBps = config.feeBps;
+  dustThresholdUsd = Number(config.dustThresholdUsd) || 0.001;
   const chainId = Number(config.chainId ?? 8453);
   // Mirror the SDK's default RPC list per chain; --rpc overrides.
   const rpcUrls = rpcFlag ? [rpcFlag] : chainId === 8453
@@ -130,9 +131,14 @@ async function handleFund(body, res) {
 
   // Fail-closed — VERIFY both on-chain payment legs (read-only) before crediting.
   try {
-    const sellerOk = (await verifier.verifyTransfer(sellerTxHash, { to: SETTLEMENT_ADDR, minAtomic: usdToAtomic(priceUsd) })).ok;
-    const feeAtomic = usdToAtomic((Number(priceUsd) || 0) * (Number(feeBps) || 0) / 10000);
-    const feeOk = (await verifier.verifyTransfer(feeTxHash, { to: feeAddress, minAtomic: feeAtomic })).ok;
+    const sellerLeg = await verifier.verifyTransfer(sellerTxHash, { to: SETTLEMENT_ADDR, minAtomic: usdToAtomic(priceUsd) });
+    const sellerOk = Boolean(sellerLeg?.ok);
+    const verifiedUsd = Number(sellerLeg?.amount ?? usdToAtomic(priceUsd)) / 1e6;
+    let feeOk = true;
+    if (requiresFeeLeg({ amountUsd: verifiedUsd, feeAddress, feeBps, dustThresholdUsd })) {
+      const feeAtomic = usdToAtomic(verifiedUsd * (Number(feeBps) || 0) / 10000);
+      feeOk = (await verifier.verifyTransfer(feeTxHash, { to: feeAddress, minAtomic: feeAtomic })).ok;
+    }
     if (!sellerOk || !feeOk) return send(res, 402, { error: 'payment_unverified', detail: `seller=${sellerOk} fee=${feeOk}` });
   } catch (e) {
     return send(res, 402, { error: 'payment_unverified', detail: e.message });

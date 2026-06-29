@@ -47,6 +47,13 @@ export const buildFundReport = ({ offerId, buyerId, bookingId, n, priceUsd, sell
   feeTxHash,
 });
 
+export function requiresFeeLeg({ amountUsd, feeAddress, feeBps, dustThresholdUsd = 0.001 }) {
+  const amount = Number(amountUsd) || 0;
+  const bps = Number(feeBps) || 0;
+  const dust = Number(dustThresholdUsd) || 0.001;
+  return Boolean(feeAddress) && bps > 0 && amount >= dust && amount * bps / 10000 > 0;
+}
+
 /**
  * DRAW report (#129): a metered delivery against the standing balance. Carries the
  * actual usage; no new payment. The platform deducts usedUsd and rejects an over-draw.
