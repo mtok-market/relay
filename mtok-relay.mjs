@@ -29,6 +29,11 @@ import { createOnchainVerifier, usdToAtomic } from './core/onchain.js';
 
 const CONTEXT_CEIL = 4096;   // context-safe upper bound on output tokens
 const BALANCE_EPSILON = 1e-6; // a balance at/under a millionth of a dollar is exhausted
+// #314: per-(bookingId, n) completion cache. n is the buyer's idempotency key; a repeat MUST return
+// the SAME completion (retry semantics), never a fresh inference -- else a buyer reusing an n meters
+// once on the platform but gets served a new inference each call (unbounded free draws).
+const served = new Map();
+const SERVED_CAP = 50000; // FIFO bound so a long-lived relay's cache can't grow unbounded
 
 // ---- parse flags ----
 const args = process.argv.slice(2);
@@ -158,6 +163,14 @@ async function handleDraw(body, res) {
   // so a client that omits n doesn't cost the seller an unmetered, unpaid inference.
   if (n == null) return send(res, 400, { error: 'bad_request', detail: 'DRAW needs a delivery index n (per-booking idempotency key)' });
 
+  // #314: idempotency. If we already served this (bookingId, n), return the SAME completion -- do
+  // NOT call upstream again. Correct for a genuine retry, AND it closes the abuse where a buyer
+  // reuses an n with a NEW prompt: the platform meters a reused n only once (idempotent return),
+  // so without this we would serve unlimited fresh inferences for one charge. n is the buyer's
+  // idempotency key; a fresh delivery needs a fresh n.
+  const cacheKey = `${bookingId}:${n}`;
+  if (served.has(cacheKey)) return send(res, 200, served.get(cacheKey));
+
   // Step 1: read the booking balance; refuse to spend inference if exhausted (402).
   let booking;
   try {
@@ -210,8 +223,11 @@ async function handleDraw(body, res) {
     return send(res, rep.status === 402 ? 402 : 502, { error: rep.body?.error?.code || rep.body?.error || 'report_failed', detail: rep.body?.error?.message || rep.status, completion, _bookingId: bookingId });
   }
 
-  // Step 6: return the completion + the post-draw remaining balance.
-  return send(res, 200, { ...completion, _bookingId: rep.booking.id, remainingUsd: rep.booking.remainingUsd });
+  // Step 6: cache by (bookingId, n) for idempotency, then return the completion + balance.
+  const payload = { ...completion, _bookingId: rep.booking.id, remainingUsd: rep.booking.remainingUsd };
+  served.set(cacheKey, payload);
+  if (served.size > SERVED_CAP) served.delete(served.keys().next().value); // FIFO bound
+  return send(res, 200, payload);
 }
 
 // ---- HTTP server ----
