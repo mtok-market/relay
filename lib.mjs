@@ -1,4 +1,4 @@
-// relay/lib.mjs — pure, dependency-free helpers for building a direct-tier seller relay.
+// packages/relay/lib.mjs — pure, dependency-free helpers for building a direct-tier seller relay.
 // No I/O. No imports. Conforms to the mtok.market chunk-report contract.
 // Use these to protect yourself before spending your inference key.
 
