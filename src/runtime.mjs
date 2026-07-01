@@ -1,10 +1,12 @@
-import { enforceModelEcho, buildFundReport, buildDrawReport, requiresFeeLeg } from '../lib.mjs';
+import { enforceModelEcho, buildFundReport, buildDrawReport, requiresFeeLeg, configuredFeeAtomic } from '../lib.mjs';
 import { createOnchainVerifier, usdToAtomic } from '../core/onchain.js';
 import { send } from './http.mjs';
+import crypto from 'node:crypto';
 
 const CONTEXT_CEIL = 4096;
 const BALANCE_EPSILON = 1e-6;
 const SERVED_CAP = 50000;
+const hash32 = (v) => '0x' + crypto.createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v ?? null)).digest('hex');
 
 const rpcUrlsFor = (chainId, rpcFlag) => rpcFlag ? [rpcFlag] : chainId === 8453
   ? ['https://mainnet.base.org', 'https://base.llamarpc.com', 'https://base-rpc.publicnode.com', 'https://base.drpc.org']
@@ -81,6 +83,7 @@ export async function createRelayRuntime(config) {
     return withBookingLock(bookingId, async () => {
       const cacheKey = `${bookingId}:${n}`;
       if (served.has(cacheKey)) return send(res, 200, served.get(cacheKey));
+      const requestHash = hash32(request);
 
       let remainingUsd;
       if (platform.dripContractAddress) {
@@ -94,6 +97,7 @@ export async function createRelayRuntime(config) {
             offerId: config.offerId,
             model: config.model,
             n,
+            requestHash,
             sellerWallet: config.settlementAddr,
             feeRecipient: platform.feeAddress,
           });
@@ -101,6 +105,14 @@ export async function createRelayRuntime(config) {
           return send(res, 402, { error: 'payment_unverified', detail: e.message });
         }
         if (!paid?.ok) return send(res, 402, { error: 'payment_unverified', detail: paid?.reason || 'unknown' });
+        const expectedFee = configuredFeeAtomic({
+          sellerUsdAtomic: paid.event.sellerUsdAtomic,
+          feeAddress: platform.feeAddress,
+          feeBps: platform.feeBps,
+        });
+        if (BigInt(paid.event.feeUsdAtomic || 0) < expectedFee) {
+          return send(res, 402, { error: 'payment_unverified', detail: 'fee_amount_too_low' });
+        }
         remainingUsd = Number(paid.event.sellerUsdAtomic || 0) / 1e6;
       } else {
         let booking;
@@ -141,7 +153,7 @@ export async function createRelayRuntime(config) {
 
       let rep;
       try {
-        rep = await reportToPlatform({ ...buildDrawReport({ offerId: config.offerId, buyerId, bookingId, n, usage: completion.usage }), ...(drawPaidTxHash ? { drawPaidTxHash } : {}) });
+        rep = await reportToPlatform({ ...buildDrawReport({ offerId: config.offerId, buyerId, bookingId, n, usage: completion.usage }), ...(drawPaidTxHash ? { drawPaidTxHash, requestHash } : {}) });
       } catch (e) {
         console.error('mtok-relay: DRAW report failed (network) for n=%d offerId=%s: %s', n, config.offerId, e.message);
         return send(res, 502, { error: 'report_failed', detail: e.message });

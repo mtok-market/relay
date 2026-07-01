@@ -54,6 +54,12 @@ export function requiresFeeLeg({ amountUsd, feeAddress, feeBps, dustThresholdUsd
   return Boolean(feeAddress) && bps > 0 && amount >= dust && amount * bps / 10000 > 0;
 }
 
+export function configuredFeeAtomic({ sellerUsdAtomic, feeAddress, feeBps }) {
+  const bps = BigInt(Math.trunc(Math.max(0, Number(feeBps) || 0)));
+  if (!feeAddress || bps === 0n) return 0n;
+  return (BigInt(sellerUsdAtomic || 0) * bps + 5000n) / 10000n;
+}
+
 /**
  * DRAW report (#129): a metered delivery against the standing balance. Carries the
  * actual usage; no new payment. The platform deducts usedUsd and rejects an over-draw.

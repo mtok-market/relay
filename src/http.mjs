@@ -38,10 +38,30 @@ export function send(res, status, body) {
 }
 
 export function startRelayServer({ config, handleFund, handleDraw }) {
+  const windows = new Map();
+  const windowMs = 60_000;
+  const maxPerMinute = Number(config.maxRequestsPerMinute ?? 120);
+  const checkRate = (req) => {
+    if (!Number.isFinite(maxPerMinute)) return true;
+    const key = req.socket.remoteAddress || 'unknown';
+    const now = Date.now();
+    let w = windows.get(key);
+    if (!w || now - w.start >= windowMs) {
+      w = { start: now, count: 0 };
+      windows.set(key, w);
+      if (windows.size > 10_000) {
+        for (const [k, v] of windows) if (now - v.start >= windowMs) windows.delete(k);
+      }
+    }
+    w.count += 1;
+    return w.count <= maxPerMinute;
+  };
+
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST' || req.url !== '/chunk') {
       return send(res, 404, { error: 'not found' });
     }
+    if (!checkRate(req)) return send(res, 429, { error: 'rate_limited' });
 
     let body;
     try { body = await readBody(req); } catch (e) {

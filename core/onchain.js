@@ -165,6 +165,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       offerId,
       model,
       n,
+      requestHash,
       sellerWallet,
       feeRecipient,
       minSellerAtomic = 0n,
@@ -189,6 +190,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       if (offerId != null && event.offerId !== String(offerId)) return { ok: false, reason: 'offer_mismatch' };
       if (model != null && event.model !== String(model)) return { ok: false, reason: 'model_mismatch' };
       if (n != null && event.n !== Number(n)) return { ok: false, reason: 'draw_n_mismatch' };
+      if (requestHash != null && lc(event.requestHash) !== lc(requestHash)) return { ok: false, reason: 'request_hash_mismatch' };
       if (BigInt(event.sellerUsdAtomic) < BigInt(minSellerAtomic)) return { ok: false, reason: 'amount_too_low' };
 
       let sellerTransfer = null;
