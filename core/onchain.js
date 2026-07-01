@@ -15,9 +15,54 @@ import { apiError } from './errors.js';
 
 // keccak256("Transfer(address,address,uint256)")
 export const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+export const DRAW_PAID_TOPIC = '0xb0243f80521d0dccd159389597aba96047e60ba5d7a9df12b67e5cb75230ac41';
 
 const topicToAddress = (topic) => '0x' + String(topic).slice(-40).toLowerCase();
 const lc = (a) => String(a || '').toLowerCase();
+const strip0x = (v) => String(v || '').replace(/^0x/i, '');
+const wordAt = (hex, i) => strip0x(hex).slice(i * 64, i * 64 + 64);
+const uintWord = (hex, i) => BigInt('0x' + (wordAt(hex, i) || '0'));
+const asciiFromHex = (hex) => {
+  const bytes = strip0x(hex);
+  const out = [];
+  for (let i = 0; i < bytes.length; i += 2) {
+    const b = parseInt(bytes.slice(i, i + 2), 16);
+    if (!Number.isFinite(b)) break;
+    out.push(b);
+  }
+  return new TextDecoder().decode(new Uint8Array(out));
+};
+
+function decodeAbiString(dataHex, offsetBytes) {
+  const body = strip0x(dataHex);
+  const start = Number(offsetBytes) * 2;
+  if (!Number.isFinite(start) || start < 0 || start + 64 > body.length) throw new Error('bad_string_offset');
+  const len = Number(BigInt('0x' + body.slice(start, start + 64)));
+  const textStart = start + 64;
+  const textEnd = textStart + len * 2;
+  if (!Number.isFinite(len) || len < 0 || textEnd > body.length) throw new Error('bad_string_length');
+  return asciiFromHex(body.slice(textStart, textEnd));
+}
+
+export function decodeDrawPaidLog(log) {
+  const data = log?.data || '0x';
+  return {
+    drawId: log?.topics?.[1],
+    sellerAgentKey: log?.topics?.[2],
+    buyerAgentKey: log?.topics?.[3],
+    sellerAgentId: decodeAbiString(data, uintWord(data, 0)),
+    buyerAgentId: decodeAbiString(data, uintWord(data, 1)),
+    bookingId: decodeAbiString(data, uintWord(data, 2)),
+    offerId: decodeAbiString(data, uintWord(data, 3)),
+    model: decodeAbiString(data, uintWord(data, 4)),
+    n: Number(uintWord(data, 5)),
+    sellerUsdAtomic: uintWord(data, 6).toString(),
+    feeUsdAtomic: uintWord(data, 7).toString(),
+    inputPricePerMTokAtomic: uintWord(data, 8).toString(),
+    outputPricePerMTokAtomic: uintWord(data, 9).toString(),
+    requestHash: '0x' + wordAt(data, 10),
+  };
+}
 
 export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedChainId, fetchImpl = globalThis.fetch,
   // A just-submitted payment can be mined on the payer's RPC yet not YET indexed by
@@ -71,6 +116,32 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
     } catch { return false; } // transient -- don't cache, retry next call
   }
 
+  async function fetchReceipt(txHash) {
+    let receipt = await rpc('eth_getTransactionReceipt', [txHash]);
+    for (let i = 0; !receipt && i < receiptRetries; i++) {
+      await sleepImpl(receiptRetryMs);
+      receipt = await rpc('eth_getTransactionReceipt', [txHash]);
+    }
+    if (!receipt) return { error: 'tx_not_found_or_pending' };
+    if (lc(receipt.transactionHash) !== lc(txHash)) return { error: 'receipt_tx_mismatch' };
+    if (receipt.status !== '0x1') return { error: 'tx_failed' };
+    return { receipt };
+  }
+
+  function findUsdcTransfer(receipt, { to, minAtomic }) {
+    const want = lc(to);
+    const log = (receipt.logs || []).find(
+      (l) => lc(l.address) === usdc
+        && l.topics?.[0] === TRANSFER_TOPIC
+        && topicToAddress(l.topics[2]) === want,
+    );
+    if (!log) return { ok: false, reason: 'no_matching_usdc_transfer' };
+    let amount;
+    try { amount = BigInt(log.data); } catch { return { ok: false, reason: 'malformed_transfer_log' }; }
+    if (amount < BigInt(minAtomic)) return { ok: false, reason: 'amount_too_low' };
+    return { ok: true, from: topicToAddress(log.topics[1]), amount: amount.toString() };
+  }
+
   return {
     configured,
 
@@ -81,32 +152,57 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       // #287: never trust a receipt from a wrong-chain RPC (a misconfigured / fallback
       // RPC answering for another chain could otherwise validate a worthless transfer).
       if (!(await assertChain())) return { ok: false, reason: 'wrong_chain' };
-      let receipt = await rpc('eth_getTransactionReceipt', [txHash]);
-      // Retry on a null receipt only — a fresh tx may not be indexed by our RPC yet.
-      // A failed/wrong tx returns a non-null receipt and is judged immediately below.
-      for (let i = 0; !receipt && i < receiptRetries; i++) {
-        await sleepImpl(receiptRetryMs);
-        receipt = await rpc('eth_getTransactionReceipt', [txHash]);
-      }
-      if (!receipt) return { ok: false, reason: 'tx_not_found_or_pending' };
-      // #308: bind the receipt to the tx we asked about. We trust this receipt's logs to credit
-      // money, so a caching/coalescing/lying RPC that returns ANOTHER tx's (real) receipt for our
-      // hash must not pass. eth_getTransactionReceipt echoes the tx hash; require it to match.
-      if (lc(receipt.transactionHash) !== lc(txHash)) return { ok: false, reason: 'receipt_tx_mismatch' };
-      if (receipt.status !== '0x1') return { ok: false, reason: 'tx_failed' };
-      const want = lc(to);
-      const log = (receipt.logs || []).find(
-        (l) => lc(l.address) === usdc
-          && l.topics?.[0] === TRANSFER_TOPIC
-          && topicToAddress(l.topics[2]) === want,
+      const got = await fetchReceipt(txHash);
+      if (got.error) return { ok: false, reason: got.error };
+      return findUsdcTransfer(got.receipt, { to, minAtomic });
+    },
+
+    async verifyDrawPaid(txHash, {
+      contractAddress,
+      buyerAgentId,
+      sellerAgentId,
+      bookingId,
+      offerId,
+      model,
+      n,
+      sellerWallet,
+      feeRecipient,
+      minSellerAtomic = 0n,
+    } = {}) {
+      if (!(await assertChain())) return { ok: false, reason: 'wrong_chain' };
+      const contract = lc(contractAddress);
+      if (!contract) return { ok: false, reason: 'contract_not_configured' };
+      const got = await fetchReceipt(txHash);
+      if (got.error) return { ok: false, reason: got.error };
+
+      const log = (got.receipt.logs || []).find((l) =>
+        lc(l.address) === contract
+        && l.topics?.[0] === DRAW_PAID_TOPIC
       );
-      if (!log) return { ok: false, reason: 'no_matching_usdc_transfer' };
-      // A malformed/non-hex log.data must fail CLOSED, not throw — the verifier contract
-      // is "never throws, returns {ok:false}" (a throw here would propagate out of reportChunk).
-      let amount;
-      try { amount = BigInt(log.data); } catch { return { ok: false, reason: 'malformed_transfer_log' }; }
-      if (amount < BigInt(minAtomic)) return { ok: false, reason: 'amount_too_low' };
-      return { ok: true, from: topicToAddress(log.topics[1]), amount: amount.toString() };
+      if (!log) return { ok: false, reason: 'no_draw_paid_event' };
+
+      let event;
+      try { event = decodeDrawPaidLog(log); } catch { return { ok: false, reason: 'malformed_draw_paid_event' }; }
+      if (buyerAgentId != null && event.buyerAgentId !== String(buyerAgentId)) return { ok: false, reason: 'buyer_agent_mismatch' };
+      if (sellerAgentId != null && event.sellerAgentId !== String(sellerAgentId)) return { ok: false, reason: 'seller_agent_mismatch' };
+      if (bookingId != null && event.bookingId !== String(bookingId)) return { ok: false, reason: 'booking_mismatch' };
+      if (offerId != null && event.offerId !== String(offerId)) return { ok: false, reason: 'offer_mismatch' };
+      if (model != null && event.model !== String(model)) return { ok: false, reason: 'model_mismatch' };
+      if (n != null && event.n !== Number(n)) return { ok: false, reason: 'draw_n_mismatch' };
+      if (BigInt(event.sellerUsdAtomic) < BigInt(minSellerAtomic)) return { ok: false, reason: 'amount_too_low' };
+
+      let sellerTransfer = null;
+      if (sellerWallet) {
+        sellerTransfer = findUsdcTransfer(got.receipt, { to: sellerWallet, minAtomic: BigInt(event.sellerUsdAtomic) });
+        if (!sellerTransfer.ok) return { ok: false, reason: 'seller_transfer_' + sellerTransfer.reason };
+      }
+      let feeTransfer = null;
+      if (feeRecipient && BigInt(event.feeUsdAtomic) > 0n) {
+        feeTransfer = findUsdcTransfer(got.receipt, { to: feeRecipient, minAtomic: BigInt(event.feeUsdAtomic) });
+        if (!feeTransfer.ok) return { ok: false, reason: 'fee_transfer_' + feeTransfer.reason };
+      }
+
+      return { ok: true, event, from: sellerTransfer?.from ?? feeTransfer?.from ?? null };
     },
   };
 }
