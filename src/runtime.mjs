@@ -1,16 +1,13 @@
-import { enforceModelEcho, buildFundReport, buildDrawReport, requiresFeeLeg, configuredFeeAtomic } from '../lib.mjs';
+import { enforceModelEcho, buildFundReport, buildDrawReport, requiresFeeLeg, configuredFeeAtomic, capOutput, paidBudgetTokensFor } from '../lib.mjs';
 import { createOnchainVerifier, usdToAtomic } from '../core/onchain.js';
 import { send } from './http.mjs';
+import { rpcUrlsFor } from './rpc.mjs';
 import crypto from 'node:crypto';
 
 const CONTEXT_CEIL = 4096;
 const BALANCE_EPSILON = 1e-6;
 const SERVED_CAP = 50000;
 const hash32 = (v) => '0x' + crypto.createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v ?? null)).digest('hex');
-
-const rpcUrlsFor = (chainId, rpcFlag) => rpcFlag ? [rpcFlag] : chainId === 8453
-  ? ['https://mainnet.base.org', 'https://base.llamarpc.com', 'https://base-rpc.publicnode.com', 'https://base.drpc.org']
-  : ['https://sepolia.base.org', 'https://base-sepolia-rpc.publicnode.com'];
 
 export async function createRelayRuntime(config) {
   const served = new Map();
@@ -130,10 +127,14 @@ export async function createRelayRuntime(config) {
         return send(res, 402, { error: 'balance_exhausted', detail: `remainingUsd=${remainingUsd}`, _bookingId: bookingId, remainingUsd });
       }
 
+      // Never generate more than (a) the context ceiling, (b) what the buyer asked
+      // for, or (c) what the standing balance paid for at the offer's output price.
       let maxTok = CONTEXT_CEIL;
       const reqMax = Number(request?.max_tokens);
-      if (reqMax > 0) maxTok = Math.min(maxTok, Math.floor(reqMax));
-      if (config.outPrice > 0) maxTok = Math.min(maxTok, Math.floor(remainingUsd / config.outPrice * 1e6));
+      if (reqMax > 0) maxTok = capOutput(maxTok, Math.floor(reqMax));
+      if (config.outPrice > 0) {
+        maxTok = capOutput(maxTok, paidBudgetTokensFor({ chunkUsd: remainingUsd, outputPricePerMTok: config.outPrice }));
+      }
       const safeRequest = { ...request, max_tokens: Math.max(1, maxTok) };
 
       let completion;
