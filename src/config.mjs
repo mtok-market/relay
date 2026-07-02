@@ -14,6 +14,15 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   const rpcFlag = flag(argv, '--rpc');
   const settlementPubkeyFlag = flag(argv, '--settlement-pubkey');
   const outPrice = Number(flag(argv, '--out-price') ?? 0);
+  // Optional payer screen for the contract-mode serve path (gates-to-classifiers
+  // groundwork, docs/chain-native-phase2.md): a comma-separated list of wallet
+  // addresses this relay refuses to serve, checked against the VERIFIED DrawPaid
+  // payer before any upstream call. Default empty = OFF = today's behavior.
+  const denylistRaw = flag(argv, '--payer-denylist') ?? env.RELAY_PAYER_DENYLIST ?? '';
+  const payerDenylist = String(denylistRaw)
+    .split(',')
+    .map((a) => a.trim().toLowerCase())
+    .filter(Boolean);
 
   if (!offerId) throw new Error('--offer <id> is required');
   if (!model) throw new Error('--model <id> is required (the offer model you serve)');
@@ -49,5 +58,6 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
     mtokApiKey,
     upstreamKey,
     settlementAddr,
+    payerDenylist,
   };
 }

@@ -16,6 +16,22 @@ export async function createRelayRuntime(config) {
   const verifier = createOnchainVerifier({ rpcUrls: rpcUrlsFor(platform.chainId, config.rpcFlag), usdcAddress: platform.usdcAddress });
   if (!verifier.configured) throw new Error('onchain verifier not configured (missing usdcAddress in /api/config)');
 
+  // Payer screen for contract-mode draws (gates-to-classifiers groundwork,
+  // docs/chain-native-phase2.md): the platform can no longer refuse money that
+  // already moved on-chain, so refusal-at-serve moves to the relay edge. The
+  // VERIFIED DrawPaid payer (the wallet that actually paid, off the USDC
+  // transfer leg) is checked against a seller-configured denylist and an
+  // optional async hook BEFORE any upstream call. Both default off/empty, so
+  // behavior is unchanged until a seller configures one.
+  const payerDenylist = new Set((config.payerDenylist ?? []).map((a) => String(a).trim().toLowerCase()).filter(Boolean));
+  const screenPayer = typeof config.screenPayer === 'function' ? config.screenPayer : null;
+  const payerDenied = async (payer) => {
+    if (!payer) return false; // no verified payer surfaced: nothing to screen
+    if (payerDenylist.has(payer)) return true;
+    if (screenPayer && (await screenPayer(payer))) return true;
+    return false;
+  };
+
   const reportToPlatform = async (reportBody) => {
     const rr = await fetch(config.apiBase + '/api/chunks/report', {
       method: 'POST',
@@ -109,6 +125,18 @@ export async function createRelayRuntime(config) {
         });
         if (BigInt(paid.event.feeUsdAtomic || 0) < expectedFee) {
           return send(res, 402, { error: 'payment_unverified', detail: 'fee_amount_too_low' });
+        }
+        // Screen the verified payer before spending upstream capacity. The
+        // payment already settled on-chain (that money is the buyer's loss);
+        // this refuses the SERVICE, which is the only refusal an edge can
+        // still make in contract mode.
+        try {
+          if (await payerDenied(String(paid.from || '').toLowerCase())) {
+            return send(res, 403, { error: 'payer_denied', detail: 'the verified payer wallet is denylisted by this relay' });
+          }
+        } catch (e) {
+          // A broken screen hook fails CLOSED: do not serve on an unscreenable payer.
+          return send(res, 403, { error: 'payer_denied', detail: 'payer screening failed: ' + e.message });
         }
         remainingUsd = Number(paid.event.sellerUsdAtomic || 0) / 1e6;
       } else {
