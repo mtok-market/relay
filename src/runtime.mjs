@@ -99,6 +99,7 @@ export async function createRelayRuntime(config) {
       const requestHash = hash32(request);
 
       let remainingUsd;
+      let paidEvent = null; // set in contract mode: the verified DrawPaid event
       if (platform.dripContractAddress) {
         if (!drawPaidTxHash) return send(res, 402, { error: 'draw_payment_required', detail: 'contract mode requires drawPaidTxHash before upstream delivery' });
         let paid;
@@ -138,6 +139,7 @@ export async function createRelayRuntime(config) {
           // A broken screen hook fails CLOSED: do not serve on an unscreenable payer.
           return send(res, 403, { error: 'payer_denied', detail: 'payer screening failed: ' + e.message });
         }
+        paidEvent = paid.event;
         remainingUsd = Number(paid.event.sellerUsdAtomic || 0) / 1e6;
       } else {
         let booking;
@@ -180,9 +182,30 @@ export async function createRelayRuntime(config) {
       try { enforceModelEcho(completion.model, config.model); }
       catch (e) { return send(res, 502, { error: 'model_mismatch', detail: e.message }); }
 
+      // ── Contract mode is REPORT-FREE (chain-native phase 2 stage 3, #387) ──
+      // The verified DrawPaid event IS the record: the platform indexes the
+      // draw from MtokDripLedger logs, so there is nothing to report (the
+      // platform 410s a drawPaidTxHash report). The flow is verify => cap =>
+      // serve => cache. This also removes the old failure mode where a
+      // verified, served draw still failed the buyer because the report
+      // bounced. remainingUsd echoes what is left of THIS draw's paid amount
+      // after metering at the event's committed per-MTok prices.
+      if (paidEvent) {
+        const usage = completion.usage ?? {};
+        const inTok = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
+        const outTok = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
+        // price is atomic USD per MTok (1e6 tokens): usd = tokens * priceAtomic / 1e12
+        const usedUsd = (inTok * Number(paidEvent.inputPricePerMTokAtomic || 0) + outTok * Number(paidEvent.outputPricePerMTokAtomic || 0)) / 1e12;
+        const payload = { ...completion, _bookingId: bookingId, remainingUsd: Math.max(0, Math.round((remainingUsd - usedUsd) * 1e6) / 1e6) };
+        served.set(cacheKey, payload);
+        if (served.size > SERVED_CAP) served.delete(served.keys().next().value);
+        return send(res, 200, payload);
+      }
+
+      // ── Legacy FUND/DRAW lane: the chain cannot see it, so keep reporting ──
       let rep;
       try {
-        rep = await reportToPlatform({ ...buildDrawReport({ offerId: config.offerId, buyerId, bookingId, n, usage: completion.usage }), ...(drawPaidTxHash ? { drawPaidTxHash, requestHash } : {}) });
+        rep = await reportToPlatform(buildDrawReport({ offerId: config.offerId, buyerId, bookingId, n, usage: completion.usage }));
       } catch (e) {
         console.error('mtok-relay: DRAW report failed (network) for n=%d offerId=%s: %s', n, config.offerId, e.message);
         return send(res, 502, { error: 'report_failed', detail: e.message });
