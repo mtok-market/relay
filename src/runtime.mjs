@@ -135,9 +135,17 @@ export async function createRelayRuntime(config) {
     if (n == null) return send(res, 400, { error: 'bad_request', detail: 'DRAW needs a delivery index n (per-booking idempotency key)' });
 
     return withBookingLock(bookingId, async () => {
-      const cacheKey = `${bookingId}:${n}`;
-      if (served.has(cacheKey)) return send(res, 200, served.get(cacheKey));
       const requestHash = hash32(request);
+      // The cache key BINDS the request preimage (requestHash), not just the
+      // public bookingId + n. bookingId and n are emitted in plaintext in the
+      // on-chain DrawPaid event, so keying on them alone would return a buyer's
+      // paid, private completion to any stranger who read the chain and replayed
+      // those two fields. requestHash is a hash of the exact prompt: an honest
+      // retry sends the same request and hits the same entry, but a caller who
+      // does not have the prompt cannot produce a key that hits (and a forged
+      // request would miss, then fail verifyDrawPaid's own requestHash check).
+      const cacheKey = `${bookingId}:${n}:${requestHash}`;
+      if (served.has(cacheKey)) return send(res, 200, served.get(cacheKey));
 
       let remainingUsd;
       let paidEvent = null; // set in contract mode: the verified DrawPaid event
