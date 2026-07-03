@@ -7,10 +7,51 @@ import crypto from 'node:crypto';
 const CONTEXT_CEIL = 4096;
 const BALANCE_EPSILON = 1e-6;
 const SERVED_CAP = 50000;
+// The served cache is a per-(bookingId,n) idempotency + compute-dedupe: a repeat delivery
+// index n returns the SAME completion without re-running upstream. It is NOT the money guard.
+// So bound its MEMORY -- 50000 full completion payloads with no size/age limit is hundreds of
+// MB to GB of RSS. Add a byte cap and a TTL:
+//   - SERVED_MAX_BYTES: evict oldest entries until the total serialized bytes fit. One large
+//     completion can no longer pin unbounded memory.
+//   - SERVED_TTL_MS: entries expire so a long-lived relay does not accrete forever.
+// EVICTION-REPLAY TRADEOFF (kept deliberate): once an entry is evicted (age or memory pressure),
+// a replayed (bookingId,n) with the same valid payment re-runs upstream, so the SELLER pays for
+// the compute twice. That is a memory-vs-compute call, NOT a money-safety hole: the buyer's
+// on-chain payment (consumedProofs / the verified DrawPaid) is the real double-charge guard, and
+// it is untouched here. So keep the TTL long enough to cover realistic retry windows (default 1h)
+// and the byte cap high enough that only genuine memory pressure evicts.
+const SERVED_MAX_BYTES = 64 * 1024 * 1024; // ~64 MB of cached completion payloads
+const SERVED_TTL_MS = 60 * 60 * 1000;      // 1h: comfortably covers realistic retry windows
 const hash32 = (v) => '0x' + crypto.createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v ?? null)).digest('hex');
 
+// A bounded, TTL'd insertion-ordered cache for served completions. Bounds by entry COUNT,
+// total BYTES, and AGE. A Map preserves insertion order, so keys().next() is the oldest.
+export function createServedCache({ maxEntries = SERVED_CAP, maxBytes = SERVED_MAX_BYTES, ttlMs = SERVED_TTL_MS, now = () => Date.now() } = {}) {
+  const map = new Map(); // cacheKey => { payload, bytes, at }
+  let totalBytes = 0;
+  const drop = (key) => { const e = map.get(key); if (e) { totalBytes -= e.bytes; map.delete(key); } };
+  const evictOldest = () => { const k = map.keys().next().value; if (k !== undefined) drop(k); };
+  return {
+    has(key) {
+      const e = map.get(key);
+      if (!e) return false;
+      if (now() - e.at > ttlMs) { drop(key); return false; } // expired: treat as a miss
+      return true;
+    },
+    get(key) { return map.get(key)?.payload; },
+    set(key, payload) {
+      let bytes;
+      try { bytes = Buffer.byteLength(JSON.stringify(payload)); } catch { bytes = 0; }
+      drop(key); // replace cleanly if it already existed (keep byte accounting honest)
+      map.set(key, { payload, bytes, at: now() });
+      totalBytes += bytes;
+      while (map.size > maxEntries || (totalBytes > maxBytes && map.size > 1)) evictOldest();
+    },
+  };
+}
+
 export async function createRelayRuntime(config) {
-  const served = new Map();
+  const served = createServedCache();
   const drawLocks = new Map();
   const platform = await fetchPlatformConfig(config);
   const verifier = createOnchainVerifier({ rpcUrls: rpcUrlsFor(platform.chainId, config.rpcFlag), usdcAddress: platform.usdcAddress });
@@ -197,8 +238,7 @@ export async function createRelayRuntime(config) {
         // price is atomic USD per MTok (1e6 tokens): usd = tokens * priceAtomic / 1e12
         const usedUsd = (inTok * Number(paidEvent.inputPricePerMTokAtomic || 0) + outTok * Number(paidEvent.outputPricePerMTokAtomic || 0)) / 1e12;
         const payload = { ...completion, _bookingId: bookingId, remainingUsd: Math.max(0, Math.round((remainingUsd - usedUsd) * 1e6) / 1e6) };
-        served.set(cacheKey, payload);
-        if (served.size > SERVED_CAP) served.delete(served.keys().next().value);
+        served.set(cacheKey, payload); // bounded by count + bytes + TTL inside the cache
         return send(res, 200, payload);
       }
 
@@ -216,8 +256,7 @@ export async function createRelayRuntime(config) {
       }
 
       const payload = { ...completion, _bookingId: rep.booking.id, remainingUsd: rep.booking.remainingUsd };
-      served.set(cacheKey, payload);
-      if (served.size > SERVED_CAP) served.delete(served.keys().next().value);
+      served.set(cacheKey, payload); // bounded by count + bytes + TTL inside the cache
       return send(res, 200, payload);
     });
   };

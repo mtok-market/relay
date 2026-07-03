@@ -4,7 +4,12 @@ export const MAX_BODY_BYTES = 256_000;
 
 export function readBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
   return new Promise((resolve, reject) => {
-    let raw = '';
+    // Accumulate raw Buffers and decode ONCE at the end (#419): `raw += d` on a Buffer
+    // coerces each chunk through toString() independently, so a multi-byte UTF-8 codepoint
+    // (emoji / CJK / accented char) straddling a TCP chunk boundary decodes as mojibake.
+    // Buffer.concat + a single utf8 decode reassembles the split sequence correctly. It
+    // also keeps the byte accounting honest: `bytes` counts raw bytes, matching maxBytes.
+    const chunks = [];
     let bytes = 0;
     let settled = false;
     req.on('data', (d) => {
@@ -16,11 +21,12 @@ export function readBody(req, { maxBytes = MAX_BODY_BYTES } = {}) {
         return;
       }
       if (settled) return;
-      raw += d;
+      chunks.push(d);
     });
     req.on('end', () => {
       if (settled) return;
       settled = true;
+      const raw = Buffer.concat(chunks).toString('utf8');
       try { resolve(JSON.parse(raw || '{}')); } catch { resolve({}); }
     });
     req.on('error', (e) => {
