@@ -1,14 +1,19 @@
 #!/usr/bin/env node
 // Reference seller relay for mtok.market.
 //
-// The buyer signs and submits each on-chain payment, then sends confirmed tx
-// hashes here. This relay only verifies those tx hashes before spending the
-// seller's inference key. It never submits transactions and never holds money.
+// Chain-only (#487): the buyer pays per draw on-chain via the drip contract
+// (MtokDripLedger), then sends the confirmed drawPaidTxHash here. This relay
+// verifies the DrawPaid event on-chain before spending the seller's inference
+// key, serves against it, and reports NOTHING to the platform (the platform
+// indexes the draw from Base). It never submits transactions, never holds
+// money, and holds no platform secret. The legacy direct-transfer FUND lane
+// is gone.
 //
 // Required env:
-//   MTOK_API_KEY      seller API key
 //   UPSTREAM_KEY      inference provider API key
 //   RELAY_WALLET_KEY  seller EVM key, only to derive settlement address
+// Optional env:
+//   MTOK_API_KEY      unused since #487 (accepted for backward compat only)
 //
 // Usage:
 //   npx mtok-relay --offer <offerId> --model <id> --upstream <url> [--api <base>] [--port <n>] [--rpc <url>] [--settlement-pubkey <0x...>]

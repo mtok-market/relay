@@ -28,11 +28,14 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   if (!model) throw new Error('--model <id> is required (the offer model you serve)');
   if (!upstream) throw new Error('--upstream <url> is required');
 
+  // MTOK_API_KEY is retained ONLY for backward compat (#487): the chain-only relay
+  // holds no platform secret. It no longer reports to the platform (POST /api/chunks/report
+  // is deleted) and no longer reads /api/bookings/:id, so this key is unused. It is
+  // accepted-if-present but no longer required.
   const mtokApiKey = env.MTOK_API_KEY;
   const upstreamKey = env.UPSTREAM_KEY;
   const relayWalletKey = env.RELAY_WALLET_KEY;
 
-  if (!mtokApiKey) throw new Error('MTOK_API_KEY env var is required');
   if (!upstreamKey) throw new Error('UPSTREAM_KEY env var is required');
   if (!relayWalletKey && !settlementPubkeyFlag) {
     throw new Error('RELAY_WALLET_KEY env var (or --settlement-pubkey) is required');

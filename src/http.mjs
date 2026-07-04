@@ -43,7 +43,7 @@ export function send(res, status, body) {
   res.end(payload);
 }
 
-export function startRelayServer({ config, handleFund, handleDraw }) {
+export function startRelayServer({ config, handleDraw }) {
   const windows = new Map();
   const windowMs = 60_000;
   const maxPerMinute = Number(config.maxRequestsPerMinute ?? 120);
@@ -75,12 +75,14 @@ export function startRelayServer({ config, handleFund, handleDraw }) {
       return send(res, 400, { error: 'bad body' });
     }
 
-    const hasFund = body.sellerTxHash != null && body.sellerTxHash !== '';
-    const hasDraw = body.request != null;
-    if (hasFund && hasDraw) return send(res, 400, { error: 'bad_request', detail: 'send a FUND (sellerTxHash) or a DRAW (request), not both' });
-    if (hasFund) return handleFund(body, res);
-    if (hasDraw) return handleDraw(body, res);
-    return send(res, 400, { error: 'bad_request', detail: 'need a FUND (sellerTxHash) or a DRAW (request)' });
+    // Contract-mode DRAW only (#487). The legacy direct-transfer FUND lane
+    // (sellerTxHash -> POST /api/chunks/report) is retired: the market is
+    // chain-native, so a buyer pays per draw on-chain (MtokDripLedger) and the
+    // relay serves against the verified DrawPaid. A DRAW carries request.messages.
+    if (body.request == null) {
+      return send(res, 400, { error: 'bad_request', detail: 'need a DRAW (request); the legacy FUND lane is retired, pay per draw on-chain' });
+    }
+    return handleDraw(body, res);
   });
 
   server.listen(config.port, () => {

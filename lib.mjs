@@ -1,6 +1,7 @@
-// packages/relay/lib.mjs — pure, dependency-free helpers for building a direct-tier seller relay.
-// No I/O. No imports. Conforms to the mtok.market chunk-report contract.
-// Use these to protect yourself before spending your inference key.
+// packages/relay/lib.mjs — pure, dependency-free helpers for a chain-only direct-tier
+// seller relay. No I/O. No imports. Use these to protect yourself before spending your
+// inference key: cap output to what the on-chain draw paid for, echo the real model,
+// and check the committed platform fee against the verified DrawPaid event.
 
 /**
  * Output-token budget a chunk's USD price pays for, given the offer's output price
@@ -27,48 +28,14 @@ export function enforceModelEcho(upstreamModel, offerModel) {
     throw new Error(`model mismatch: upstream ${upstreamModel} != offer ${offerModel}`);
 }
 
-// NOTE: the legacy single-call buildReport (a combined FUND+DRAW in one report) was
-// removed (#129). The platform now rejects a report that carries BOTH a FUND
-// (sellerTxHash) and a DRAW (token counts) — a combined report had a retry hole.
-// Build a FUND with buildFundReport, then a DRAW with buildDrawReport.
-
-/**
- * FUND report (#129): an on-chain top-up of the booking balance. Carries the
- * verified-payment tx hashes; no tokens delivered. The platform re-verifies on-chain
- * and credits paidUsd by the verified amount.
- */
-export const buildFundReport = ({ offerId, buyerId, bookingId, n, priceUsd, sellerTxHash, feeTxHash }) => ({
-  offerId,
-  buyerId,
-  ...(bookingId ? { bookingId } : {}),
-  n,
-  priceUsd,
-  sellerTxHash,
-  feeTxHash,
-});
-
-export function requiresFeeLeg({ amountUsd, feeAddress, feeBps, dustThresholdUsd = 0.001 }) {
-  const amount = Number(amountUsd) || 0;
-  const bps = Number(feeBps) || 0;
-  const dust = Number(dustThresholdUsd) || 0.001;
-  return Boolean(feeAddress) && bps > 0 && amount >= dust && amount * bps / 10000 > 0;
-}
+// NOTE: the legacy report builders (buildFundReport / buildDrawReport / requiresFeeLeg)
+// were removed with the chain-only collapse (#487): the platform deleted
+// POST /api/chunks/report, so the reference relay reports NOTHING. A buyer pays per
+// draw on-chain (MtokDripLedger) and the relay serves against the verified DrawPaid.
+// The fee is now checked on-chain against the event, via configuredFeeAtomic below.
 
 export function configuredFeeAtomic({ sellerUsdAtomic, feeAddress, feeBps }) {
   const bps = BigInt(Math.trunc(Math.max(0, Number(feeBps) || 0)));
   if (!feeAddress || bps === 0n) return 0n;
   return (BigInt(sellerUsdAtomic || 0) * bps + 5000n) / 10000n;
 }
-
-/**
- * DRAW report (#129): a metered delivery against the standing balance. Carries the
- * actual usage; no new payment. The platform deducts usedUsd and rejects an over-draw.
- */
-export const buildDrawReport = ({ offerId, buyerId, bookingId, n, usage }) => ({
-  offerId,
-  buyerId,
-  bookingId,
-  n,
-  inputTokens: usage?.prompt_tokens ?? 0,
-  outputTokens: usage?.completion_tokens ?? 0,
-});

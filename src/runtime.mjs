@@ -1,5 +1,5 @@
-import { enforceModelEcho, buildFundReport, buildDrawReport, requiresFeeLeg, configuredFeeAtomic, capOutput, paidBudgetTokensFor } from '../lib.mjs';
-import { createOnchainVerifier, usdToAtomic } from '../core/onchain.js';
+import { enforceModelEcho, configuredFeeAtomic, capOutput, paidBudgetTokensFor } from '../lib.mjs';
+import { createOnchainVerifier } from '../core/onchain.js';
 import { send } from './http.mjs';
 import { rpcUrlsFor } from './rpc.mjs';
 import crypto from 'node:crypto';
@@ -73,16 +73,6 @@ export async function createRelayRuntime(config) {
     return false;
   };
 
-  const reportToPlatform = async (reportBody) => {
-    const rr = await fetch(config.apiBase + '/api/chunks/report', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'x-api-key': config.mtokApiKey },
-      body: JSON.stringify(reportBody),
-    });
-    const body = await rr.json().catch(() => ({}));
-    return { ok: rr.status === 201, status: rr.status, body, booking: body?.booking ?? null };
-  };
-
   const withBookingLock = async (bookingId, fn) => {
     const previous = drawLocks.get(bookingId) || Promise.resolve();
     let release;
@@ -96,37 +86,6 @@ export async function createRelayRuntime(config) {
       release();
       if (drawLocks.get(bookingId) === tail) drawLocks.delete(bookingId);
     }
-  };
-
-  const handleFund = async (body, res) => {
-    const { bookingId, n, sellerTxHash, feeTxHash, priceUsd, buyerId } = body;
-
-    try {
-      const sellerLeg = await verifier.verifyTransfer(sellerTxHash, { to: config.settlementAddr, minAtomic: usdToAtomic(priceUsd) });
-      const sellerOk = Boolean(sellerLeg?.ok);
-      const verifiedUsd = Number(sellerLeg?.amount ?? usdToAtomic(priceUsd)) / 1e6;
-      let feeOk = true;
-      if (requiresFeeLeg({ amountUsd: verifiedUsd, feeAddress: platform.feeAddress, feeBps: platform.feeBps, dustThresholdUsd: platform.dustThresholdUsd })) {
-        const feeAtomic = usdToAtomic(verifiedUsd * (Number(platform.feeBps) || 0) / 10000);
-        feeOk = (await verifier.verifyTransfer(feeTxHash, { to: platform.feeAddress, minAtomic: feeAtomic })).ok;
-      }
-      if (!sellerOk || !feeOk) return send(res, 402, { error: 'payment_unverified', detail: `seller=${sellerOk} fee=${feeOk}` });
-    } catch (e) {
-      return send(res, 402, { error: 'payment_unverified', detail: e.message });
-    }
-
-    let rep;
-    try {
-      rep = await reportToPlatform(buildFundReport({ offerId: config.offerId, buyerId, bookingId, n, priceUsd, sellerTxHash, feeTxHash }));
-    } catch (e) {
-      return send(res, 502, { error: 'report_failed', detail: e.message });
-    }
-    if (!rep.ok || !rep.booking) {
-      console.error('mtok-relay: FUND report rejected (%d) for n=%d offerId=%s: %s', rep.status, n, config.offerId, JSON.stringify(rep.body));
-      return send(res, 502, { error: 'report_failed', detail: rep.body?.error || rep.status });
-    }
-
-    return send(res, 200, { ...rep.booking, _bookingId: rep.booking.id, remainingUsd: rep.booking.remainingUsd });
   };
 
   const handleDraw = async (body, res) => {
@@ -147,61 +106,53 @@ export async function createRelayRuntime(config) {
       const cacheKey = `${bookingId}:${n}:${requestHash}`;
       if (served.has(cacheKey)) return send(res, 200, served.get(cacheKey));
 
-      let remainingUsd;
-      let paidEvent = null; // set in contract mode: the verified DrawPaid event
-      if (platform.dripContractAddress) {
-        if (!drawPaidTxHash) return send(res, 402, { error: 'draw_payment_required', detail: 'contract mode requires drawPaidTxHash before upstream delivery' });
-        let paid;
-        try {
-          paid = await verifier.verifyDrawPaid(drawPaidTxHash, {
-            contractAddress: platform.dripContractAddress,
-            buyerAgentId: buyerId,
-            bookingId,
-            offerId: config.offerId,
-            model: config.model,
-            n,
-            requestHash,
-            sellerWallet: config.settlementAddr,
-            feeRecipient: platform.feeAddress,
-          });
-        } catch (e) {
-          return send(res, 402, { error: 'payment_unverified', detail: e.message });
-        }
-        if (!paid?.ok) return send(res, 402, { error: 'payment_unverified', detail: paid?.reason || 'unknown' });
-        const expectedFee = configuredFeeAtomic({
-          sellerUsdAtomic: paid.event.sellerUsdAtomic,
-          feeAddress: platform.feeAddress,
-          feeBps: platform.feeBps,
-        });
-        if (BigInt(paid.event.feeUsdAtomic || 0) < expectedFee) {
-          return send(res, 402, { error: 'payment_unverified', detail: 'fee_amount_too_low' });
-        }
-        // Screen the verified payer before spending upstream capacity. The
-        // payment already settled on-chain (that money is the buyer's loss);
-        // this refuses the SERVICE, which is the only refusal an edge can
-        // still make in contract mode.
-        try {
-          if (await payerDenied(String(paid.from || '').toLowerCase())) {
-            return send(res, 403, { error: 'payer_denied', detail: 'the verified payer wallet is denylisted by this relay' });
-          }
-        } catch (e) {
-          // A broken screen hook fails CLOSED: do not serve on an unscreenable payer.
-          return send(res, 403, { error: 'payer_denied', detail: 'payer screening failed: ' + e.message });
-        }
-        paidEvent = paid.event;
-        remainingUsd = Number(paid.event.sellerUsdAtomic || 0) / 1e6;
-      } else {
-        let booking;
-        try {
-          const r = await fetch(config.apiBase + `/api/bookings/${encodeURIComponent(bookingId)}`, { headers: { 'x-api-key': config.mtokApiKey } });
-          const rb = await r.json().catch(() => ({}));
-          if (r.status !== 200 || !rb?.booking) return send(res, 502, { error: 'booking_read_failed', detail: rb?.error || r.status });
-          booking = rb.booking;
-        } catch (e) {
-          return send(res, 502, { error: 'booking_read_failed', detail: e.message });
-        }
-        remainingUsd = Number(booking.remainingUsd) || 0;
+      // Contract mode is the ONLY mode (#487): the legacy direct-transfer FUND
+      // lane and its /api/bookings/:id balance read are gone. If the platform is
+      // not running the drip contract, REFUSE the draw with a clear error rather
+      // than fall back to a lane that no longer exists.
+      if (!platform.dripContractAddress) {
+        return send(res, 402, { error: 'contract_mode_required', detail: 'this relay only serves contract-mode draws; the platform is not reporting a dripContractAddress' });
       }
+      if (!drawPaidTxHash) return send(res, 402, { error: 'draw_payment_required', detail: 'contract mode requires drawPaidTxHash before upstream delivery' });
+      let paid;
+      try {
+        paid = await verifier.verifyDrawPaid(drawPaidTxHash, {
+          contractAddress: platform.dripContractAddress,
+          buyerAgentId: buyerId,
+          bookingId,
+          offerId: config.offerId,
+          model: config.model,
+          n,
+          requestHash,
+          sellerWallet: config.settlementAddr,
+          feeRecipient: platform.feeAddress,
+        });
+      } catch (e) {
+        return send(res, 402, { error: 'payment_unverified', detail: e.message });
+      }
+      if (!paid?.ok) return send(res, 402, { error: 'payment_unverified', detail: paid?.reason || 'unknown' });
+      const expectedFee = configuredFeeAtomic({
+        sellerUsdAtomic: paid.event.sellerUsdAtomic,
+        feeAddress: platform.feeAddress,
+        feeBps: platform.feeBps,
+      });
+      if (BigInt(paid.event.feeUsdAtomic || 0) < expectedFee) {
+        return send(res, 402, { error: 'payment_unverified', detail: 'fee_amount_too_low' });
+      }
+      // Screen the verified payer before spending upstream capacity. The
+      // payment already settled on-chain (that money is the buyer's loss);
+      // this refuses the SERVICE, which is the only refusal an edge can
+      // still make in contract mode.
+      try {
+        if (await payerDenied(String(paid.from || '').toLowerCase())) {
+          return send(res, 403, { error: 'payer_denied', detail: 'the verified payer wallet is denylisted by this relay' });
+        }
+      } catch (e) {
+        // A broken screen hook fails CLOSED: do not serve on an unscreenable payer.
+        return send(res, 403, { error: 'payer_denied', detail: 'payer screening failed: ' + e.message });
+      }
+      const paidEvent = paid.event;
+      const remainingUsd = Number(paid.event.sellerUsdAtomic || 0) / 1e6;
       if (remainingUsd <= BALANCE_EPSILON) {
         return send(res, 402, { error: 'balance_exhausted', detail: `remainingUsd=${remainingUsd}`, _bookingId: bookingId, remainingUsd });
       }
@@ -234,42 +185,22 @@ export async function createRelayRuntime(config) {
       // ── Contract mode is REPORT-FREE (chain-native phase 2 stage 3, #387) ──
       // The verified DrawPaid event IS the record: the platform indexes the
       // draw from MtokDripLedger logs, so there is nothing to report (the
-      // platform 410s a drawPaidTxHash report). The flow is verify => cap =>
-      // serve => cache. This also removes the old failure mode where a
-      // verified, served draw still failed the buyer because the report
-      // bounced. remainingUsd echoes what is left of THIS draw's paid amount
+      // platform deleted POST /api/chunks/report in #487). The flow is
+      // verify => cap => serve => cache, and the relay holds no platform
+      // secret. remainingUsd echoes what is left of THIS draw's paid amount
       // after metering at the event's committed per-MTok prices.
-      if (paidEvent) {
-        const usage = completion.usage ?? {};
-        const inTok = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
-        const outTok = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
-        // price is atomic USD per MTok (1e6 tokens): usd = tokens * priceAtomic / 1e12
-        const usedUsd = (inTok * Number(paidEvent.inputPricePerMTokAtomic || 0) + outTok * Number(paidEvent.outputPricePerMTokAtomic || 0)) / 1e12;
-        const payload = { ...completion, _bookingId: bookingId, remainingUsd: Math.max(0, Math.round((remainingUsd - usedUsd) * 1e6) / 1e6) };
-        served.set(cacheKey, payload); // bounded by count + bytes + TTL inside the cache
-        return send(res, 200, payload);
-      }
-
-      // ── Legacy FUND/DRAW lane: the chain cannot see it, so keep reporting ──
-      let rep;
-      try {
-        rep = await reportToPlatform(buildDrawReport({ offerId: config.offerId, buyerId, bookingId, n, usage: completion.usage }));
-      } catch (e) {
-        console.error('mtok-relay: DRAW report failed (network) for n=%d offerId=%s: %s', n, config.offerId, e.message);
-        return send(res, 502, { error: 'report_failed', detail: e.message });
-      }
-      if (!rep.ok || !rep.booking) {
-        console.error('mtok-relay: DRAW report rejected (%d) for n=%d offerId=%s: %s', rep.status, n, config.offerId, JSON.stringify(rep.body));
-        return send(res, rep.status === 402 ? 402 : 502, { error: rep.body?.error?.code || rep.body?.error || 'report_failed', detail: rep.body?.error?.message || rep.status, _bookingId: bookingId });
-      }
-
-      const payload = { ...completion, _bookingId: rep.booking.id, remainingUsd: rep.booking.remainingUsd };
+      const usage = completion.usage ?? {};
+      const inTok = Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0;
+      const outTok = Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0;
+      // price is atomic USD per MTok (1e6 tokens): usd = tokens * priceAtomic / 1e12
+      const usedUsd = (inTok * Number(paidEvent.inputPricePerMTokAtomic || 0) + outTok * Number(paidEvent.outputPricePerMTokAtomic || 0)) / 1e12;
+      const payload = { ...completion, _bookingId: bookingId, remainingUsd: Math.max(0, Math.round((remainingUsd - usedUsd) * 1e6) / 1e6) };
       served.set(cacheKey, payload); // bounded by count + bytes + TTL inside the cache
       return send(res, 200, payload);
     });
   };
 
-  return { handleFund, handleDraw };
+  return { handleDraw };
 }
 
 async function fetchPlatformConfig(config) {
