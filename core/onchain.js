@@ -193,7 +193,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
 
       const log = (got.receipt.logs || []).find((l) =>
         lc(l.address) === contract
-        && l.topics?.[0] === DRAW_PAID_TOPIC
+        && DRAW_PAID_TOPICS.includes(lc(l.topics?.[0]))
       );
       if (!log) return { ok: false, reason: 'no_draw_paid_event' };
 
