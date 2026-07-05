@@ -1,57 +1,19 @@
-import { enforceModelEcho, configuredFeeAtomic, capOutput, paidBudgetTokensFor } from '../lib.mjs';
+import { enforceModelEcho, configuredFeeAtomic, boundServe } from '../lib.mjs';
+import { createRedemptionStore } from './redemption.mjs';
 import { createOnchainVerifier } from '../core/onchain.js';
 import { send } from './http.mjs';
 import { rpcUrlsFor } from './rpc.mjs';
 import crypto from 'node:crypto';
 
-const CONTEXT_CEIL = 4096;
 const BALANCE_EPSILON = 1e-6;
-const SERVED_CAP = 50000;
-// The served cache is a per-(bookingId,n) idempotency + compute-dedupe: a repeat delivery
-// index n returns the SAME completion without re-running upstream. It is NOT the money guard.
-// So bound its MEMORY -- 50000 full completion payloads with no size/age limit is hundreds of
-// MB to GB of RSS. Add a byte cap and a TTL:
-//   - SERVED_MAX_BYTES: evict oldest entries until the total serialized bytes fit. One large
-//     completion can no longer pin unbounded memory.
-//   - SERVED_TTL_MS: entries expire so a long-lived relay does not accrete forever.
-// EVICTION-REPLAY TRADEOFF (kept deliberate): once an entry is evicted (age or memory pressure),
-// a replayed (bookingId,n) with the same valid payment re-runs upstream, so the SELLER pays for
-// the compute twice. That is a memory-vs-compute call, NOT a money-safety hole: the buyer's
-// on-chain payment (consumedProofs / the verified DrawPaid) is the real double-charge guard, and
-// it is untouched here. So keep the TTL long enough to cover realistic retry windows (default 1h)
-// and the byte cap high enough that only genuine memory pressure evicts.
-const SERVED_MAX_BYTES = 64 * 1024 * 1024; // ~64 MB of cached completion payloads
-const SERVED_TTL_MS = 60 * 60 * 1000;      // 1h: comfortably covers realistic retry windows
 const hash32 = (v) => '0x' + crypto.createHash('sha256').update(typeof v === 'string' ? v : JSON.stringify(v ?? null)).digest('hex');
 
-// A bounded, TTL'd insertion-ordered cache for served completions. Bounds by entry COUNT,
-// total BYTES, and AGE. A Map preserves insertion order, so keys().next() is the oldest.
-export function createServedCache({ maxEntries = SERVED_CAP, maxBytes = SERVED_MAX_BYTES, ttlMs = SERVED_TTL_MS, now = () => Date.now() } = {}) {
-  const map = new Map(); // cacheKey => { payload, bytes, at }
-  let totalBytes = 0;
-  const drop = (key) => { const e = map.get(key); if (e) { totalBytes -= e.bytes; map.delete(key); } };
-  const evictOldest = () => { const k = map.keys().next().value; if (k !== undefined) drop(k); };
-  return {
-    has(key) {
-      const e = map.get(key);
-      if (!e) return false;
-      if (now() - e.at > ttlMs) { drop(key); return false; } // expired: treat as a miss
-      return true;
-    },
-    get(key) { return map.get(key)?.payload; },
-    set(key, payload) {
-      let bytes;
-      try { bytes = Buffer.byteLength(JSON.stringify(payload)); } catch { bytes = 0; }
-      drop(key); // replace cleanly if it already existed (keep byte accounting honest)
-      map.set(key, { payload, bytes, at: now() });
-      totalBytes += bytes;
-      while (map.size > maxEntries || (totalBytes > maxBytes && map.size > 1)) evictOldest();
-    },
-  };
-}
-
 export async function createRelayRuntime(config) {
-  const served = createServedCache();
+  // Durable redemption (#495): a paid draw serves exactly once and an honest retry
+  // replays the stored completion, across restarts. verifyDrawPaid is a permanent
+  // chain read that consumes nothing, so this store -- NOT a TTL cache -- is the
+  // one-serve-per-payment guard. See src/redemption.mjs for the durability model.
+  const served = createRedemptionStore({ file: config.redemptionFile });
   const drawLocks = new Map();
   const platform = await fetchPlatformConfig(config);
   const verifier = createOnchainVerifier({ rpcUrls: rpcUrlsFor(platform.chainId, config.rpcFlag), usdcAddress: platform.usdcAddress });
@@ -157,15 +119,20 @@ export async function createRelayRuntime(config) {
         return send(res, 402, { error: 'balance_exhausted', detail: `remainingUsd=${remainingUsd}`, _bookingId: bookingId, remainingUsd });
       }
 
-      // Never generate more than (a) the context ceiling, (b) what the buyer asked
-      // for, or (c) what the standing balance paid for at the offer's output price.
-      let maxTok = CONTEXT_CEIL;
-      const reqMax = Number(request?.max_tokens);
-      if (reqMax > 0) maxTok = capOutput(maxTok, Math.floor(reqMax));
-      if (config.outPrice > 0) {
-        maxTok = capOutput(maxTok, paidBudgetTokensFor({ chunkUsd: remainingUsd, outputPricePerMTok: config.outPrice }));
+      // Bound BOTH legs against what the draw paid for (#495/#460). The relay used
+      // to cap only OUTPUT, so a dust draw + a huge prompt got its output capped but
+      // the whole prompt forwarded => the seller ate unbounded upstream INPUT compute.
+      // Now: REFUSE before any upstream call if the estimated input cost alone meets
+      // the payment, else cap output over the budget LEFT after input. Input is priced
+      // at the higher of our offer price and the buyer's committed event price, so the
+      // buyer can't zero the input leg to sneak a big prompt.
+      const eventInPriceUsd = Number(paidEvent.inputPricePerMTokAtomic || 0) / 1e6;
+      const inPrice = Math.max(Number(config.inPrice) || 0, eventInPriceUsd);
+      const bound = boundServe({ messages: request?.messages, budgetUsd: remainingUsd, inPrice, outPrice: config.outPrice, reqMax: Number(request?.max_tokens) });
+      if (bound.refuse) {
+        return send(res, 402, { error: 'input_too_large', detail: `estimated input (~${bound.estIn} tokens, $${bound.estInCostUsd.toFixed(6)}) meets or exceeds the paid amount ($${remainingUsd}); send a shorter prompt or pay for more`, _bookingId: bookingId, remainingUsd });
       }
-      const safeRequest = { ...request, max_tokens: Math.max(1, maxTok) };
+      const safeRequest = { ...request, max_tokens: bound.maxTok };
 
       let completion;
       try {
