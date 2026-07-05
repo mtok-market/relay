@@ -15,7 +15,13 @@ import { apiError } from './errors.js';
 
 // keccak256("Transfer(address,address,uint256)")
 export const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+// DrawPaid has two on-chain shapes: the original (v1), and v2 (#494) which appends
+// `address seller, address buyer` (the pay-time wallets). We match BOTH topics so
+// the fold reads across a contract redeploy: v1 events (old contract, floored out
+// by dripDeployBlock post-cutover) decode without wallets; v2 events carry them.
 export const DRAW_PAID_TOPIC = '0xb0243f80521d0dccd159389597aba96047e60ba5d7a9df12b67e5cb75230ac41';
+export const DRAW_PAID_TOPIC_V2 = '0x94f9e7578a5c019f78ad332dcb2dc5563bcf257d777009ff5cef4118f084a70b';
+export const DRAW_PAID_TOPICS = [DRAW_PAID_TOPIC, DRAW_PAID_TOPIC_V2];
 
 const topicToAddress = (topic) => '0x' + String(topic).slice(-40).toLowerCase();
 const lc = (a) => String(a || '').toLowerCase();
@@ -46,7 +52,11 @@ function decodeAbiString(dataHex, offsetBytes) {
 
 export function decodeDrawPaidLog(log) {
   const data = log?.data || '0x';
-  return {
+  // v2 (#494) appends two fixed head words after requestHash: seller, buyer wallets.
+  // The string offsets (words 0-4) are self-describing, so string decoding is
+  // unaffected by the larger head; only the two extra words are shape-dependent.
+  const isV2 = String(log?.topics?.[0] || '').toLowerCase() === DRAW_PAID_TOPIC_V2;
+  const out = {
     drawId: log?.topics?.[1],
     sellerAgentKey: log?.topics?.[2],
     buyerAgentKey: log?.topics?.[3],
@@ -62,6 +72,11 @@ export function decodeDrawPaidLog(log) {
     outputPricePerMTokAtomic: uintWord(data, 9).toString(),
     requestHash: '0x' + wordAt(data, 10),
   };
+  if (isV2) {
+    out.seller = topicToAddress(wordAt(data, 11));
+    out.buyer = topicToAddress(wordAt(data, 12));
+  }
+  return out;
 }
 
 export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedChainId, fetchImpl = globalThis.fetch,
