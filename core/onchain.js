@@ -208,8 +208,3 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
     },
   };
 }
-
-// USD (e.g. 0.02) -> USDC atomic units (6 decimals), as a BigInt.
-export function usdToAtomic(usd) {
-  return BigInt(Math.round(Number(usd) * 1e6));
-}

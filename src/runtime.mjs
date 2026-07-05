@@ -58,7 +58,7 @@ export async function createRelayRuntime(config) {
   if (!verifier.configured) throw new Error('onchain verifier not configured (missing usdcAddress in /api/config)');
 
   // Payer screen for contract-mode draws (gates-to-classifiers groundwork,
-  // docs/chain-native-phase2.md): the platform can no longer refuse money that
+  // #387): the platform can no longer refuse money that
   // already moved on-chain, so refusal-at-serve moves to the relay edge. The
   // VERIFIED DrawPaid payer (the wallet that actually paid, off the USDC
   // transfer leg) is checked against a seller-configured denylist and an

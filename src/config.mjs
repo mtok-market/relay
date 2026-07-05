@@ -15,7 +15,7 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   const settlementPubkeyFlag = flag(argv, '--settlement-pubkey');
   const outPrice = Number(flag(argv, '--out-price') ?? 0);
   // Optional payer screen for the contract-mode serve path (gates-to-classifiers
-  // groundwork, docs/chain-native-phase2.md): a comma-separated list of wallet
+  // groundwork, #387): a comma-separated list of wallet
   // addresses this relay refuses to serve, checked against the VERIFIED DrawPaid
   // payer before any upstream call. Default empty = OFF = today's behavior.
   const denylistRaw = flag(argv, '--payer-denylist') ?? env.RELAY_PAYER_DENYLIST ?? '';
