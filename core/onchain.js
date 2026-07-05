@@ -22,6 +22,12 @@ export const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11
 export const DRAW_PAID_TOPIC = '0xb0243f80521d0dccd159389597aba96047e60ba5d7a9df12b67e5cb75230ac41';
 export const DRAW_PAID_TOPIC_V2 = '0x94f9e7578a5c019f78ad332dcb2dc5563bcf257d777009ff5cef4118f084a70b';
 export const DRAW_PAID_TOPICS = [DRAW_PAID_TOPIC, DRAW_PAID_TOPIC_V2];
+// The ONE way to test whether a log's topic0 is a DrawPaid (either version),
+// normalized. Every FILTER/DISPATCH site must go through this, so a future
+// event-version bump can never miss a hand-rolled comparison (the v2 redeploy
+// missed exactly one such site, verifyDrawPaid -- an SSOT gap). The singular
+// DRAW_PAID_TOPIC stays only for v1-vs-v2 discrimination in the decoder.
+export const isDrawPaidTopic = (topic) => DRAW_PAID_TOPICS.includes(String(topic || '').toLowerCase());
 
 const topicToAddress = (topic) => '0x' + String(topic).slice(-40).toLowerCase();
 const lc = (a) => String(a || '').toLowerCase();
@@ -193,7 +199,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
 
       const log = (got.receipt.logs || []).find((l) =>
         lc(l.address) === contract
-        && DRAW_PAID_TOPICS.includes(lc(l.topics?.[0]))
+        && isDrawPaidTopic(l.topics?.[0])
       );
       if (!log) return { ok: false, reason: 'no_draw_paid_event' };
 
