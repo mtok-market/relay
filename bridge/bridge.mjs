@@ -69,3 +69,29 @@ export function httpUpstream({ baseUrl, key }) {
     return json;
   };
 }
+
+// The SECOND upstream mode (#566): a Cloudflare Workers AI binding instead of an HTTP endpoint.
+// `ai` is the Worker's `env.AI` (has `.run(model, { messages, max_tokens })`). Returns the same
+// upstream(payload) contract as httpUpstream, normalizing Workers AI's output (native `{ response,
+// usage }` OR an already-OpenAI-shaped `{ choices, usage }`) into a standard chat.completion, so a
+// caller reads one shape no matter which upstream it composed. Leaves `id`/`created` to the caller
+// (the house seller keys its id to bookingId), and passes max_tokens through only when set.
+export function workersAiUpstream(ai) {
+  return async (payload) => {
+    const out = await ai.run(payload.model, {
+      messages: payload.messages,
+      ...(payload.max_tokens != null ? { max_tokens: Math.max(1, Number(payload.max_tokens)) } : {}),
+    });
+    const content = out?.response ?? out?.choices?.[0]?.message?.content ?? '';
+    const usage = out?.usage || {};
+    return {
+      object: 'chat.completion',
+      model: payload.model,
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: Number(usage.prompt_tokens ?? usage.input_tokens ?? 0) || 0,
+        completion_tokens: Number(usage.completion_tokens ?? usage.output_tokens ?? 0) || 0,
+      },
+    };
+  };
+}
