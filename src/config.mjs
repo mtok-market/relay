@@ -13,6 +13,11 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   const port = Number(flag(argv, '--port') ?? 8788);
   const rpcFlag = flag(argv, '--rpc');
   const settlementPubkeyFlag = flag(argv, '--settlement-pubkey');
+  // The seller agent-id that OWNS this offer (#(codex review)). When set, the relay makes
+  // verifyDrawPaid enforce that the DrawPaid event's sellerAgentId matches, so a sibling
+  // agent bound to the same wallet cannot be paid against this offer and served without the
+  // fold attributing (and draining) the real offer. Optional for back-compat; recommended.
+  const sellerAgentId = flag(argv, '--seller-agent');
   const outPrice = Number(flag(argv, '--out-price') ?? 0);
   // Input (prompt) price for the input-leg bound (#495/#460). Defaults to --out-price
   // so a seller who prices only output still bounds the input leg at a sane rate; the
@@ -62,6 +67,7 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   return {
     offerId,
     model,
+    sellerAgentId,
     upstream,
     apiBase,
     port,

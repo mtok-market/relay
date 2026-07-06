@@ -81,6 +81,7 @@ export async function createRelayRuntime(config) {
         paid = await verifier.verifyDrawPaid(drawPaidTxHash, {
           contractAddress: platform.dripContractAddress,
           buyerAgentId: buyerId,
+          sellerAgentId: config.sellerAgentId, // when set, enforces the offer-owner match (#codex review)
           bookingId,
           offerId: config.offerId,
           model: config.model,
