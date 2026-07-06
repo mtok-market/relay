@@ -1,6 +1,7 @@
 import { enforceModelEcho, configuredFeeAtomic, boundServe } from '../lib.mjs';
 import { createRedemptionStore } from './redemption.mjs';
 import { createOnchainVerifier } from '../core/onchain.js';
+import { httpUpstream } from '../bridge/bridge.mjs';
 import { send } from './http.mjs';
 import { rpcUrlsFor } from './rpc.mjs';
 import crypto from 'node:crypto';
@@ -16,7 +17,11 @@ export async function createRelayRuntime(config) {
   const served = createRedemptionStore({ file: config.redemptionFile });
   const drawLocks = new Map();
   const platform = await fetchPlatformConfig(config);
-  const verifier = createOnchainVerifier({ rpcUrls: rpcUrlsFor(platform.chainId, config.rpcFlag), usdcAddress: platform.usdcAddress });
+  // Pin the chain (codex #566 review): the verifier supports expectedChainId + a wrong_chain
+  // guard, but the relay was not passing it, so a relay pointed at a wrong or spoofed --rpc could
+  // accept a receipt from another chain and spend upstream against a payment that never landed on
+  // Base. platform.chainId is the /config-declared chain; pin to it and fail closed on mismatch.
+  const verifier = createOnchainVerifier({ rpcUrls: rpcUrlsFor(platform.chainId, config.rpcFlag), usdcAddress: platform.usdcAddress, expectedChainId: platform.chainId });
   if (!verifier.configured) throw new Error('onchain verifier not configured (missing usdcAddress in /api/config)');
 
   // Payer screen for contract-mode draws (gates-to-classifiers groundwork,
@@ -28,6 +33,12 @@ export async function createRelayRuntime(config) {
   // behavior is unchanged until a seller configures one.
   const payerDenylist = new Set((config.payerDenylist ?? []).map((a) => String(a).trim().toLowerCase()).filter(Boolean));
   const screenPayer = typeof config.screenPayer === 'function' ? config.screenPayer : null;
+
+  // The transport leg is mtok-bridge's httpUpstream (#566): the market layer here composes the
+  // bridge's forward-to-OpenAI-compatible-upstream guts instead of reimplementing the fetch. The
+  // relay's config.upstream is the API ROOT (no /v1); the bridge appends /chat/completions to its
+  // baseUrl, so we hand it config.upstream + '/v1' to keep the delivered URL byte-identical.
+  const upstream = httpUpstream({ baseUrl: config.upstream + '/v1', key: config.upstreamKey });
   const payerDenied = async (payer) => {
     if (!payer) return false; // no verified payer surfaced: nothing to screen
     if (payerDenylist.has(payer)) return true;
@@ -137,12 +148,7 @@ export async function createRelayRuntime(config) {
 
       let completion;
       try {
-        const upstreamRes = await fetch(config.upstream + '/v1/chat/completions', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: 'Bearer ' + config.upstreamKey },
-          body: JSON.stringify(safeRequest),
-        });
-        completion = await upstreamRes.json();
+        completion = await upstream(safeRequest);
       } catch (e) {
         return send(res, 502, { error: 'upstream_error', detail: e.message });
       }
