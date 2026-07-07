@@ -23,11 +23,14 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   // so a seller who prices only output still bounds the input leg at a sane rate; the
   // serve also floors input at the buyer's committed event price so it can't be zeroed.
   const inPrice = Number(flag(argv, '--in-price') ?? outPrice);
-  // Durable redemption log path (#495/#459): a paid draw serves exactly once and an
-  // honest retry replays across restarts. STRONGLY recommended for a real seller; if
-  // unset, redemption is in-memory only (a restart can re-serve one payment) and the
-  // relay warns at boot. env RELAY_REDEMPTION_FILE is the same knob.
-  const redemptionFile = flag(argv, '--redemption-file') ?? env.RELAY_REDEMPTION_FILE ?? null;
+  // Durable redemption log path (#495/#459/#568): a paid draw serves exactly once and an
+  // honest retry replays across restarts. DURABLE BY DEFAULT (#568): with no flag we still
+  // point at a file in the working dir, so `npx mtok-relay` is safe out of the box instead of
+  // the old in-memory footgun (a restart could re-serve a paid draw). Override with
+  // --redemption-file / RELAY_REDEMPTION_FILE; if the default path is not writable the store
+  // falls back to in-memory and warns loudly. Pass an empty string to force in-memory.
+  const redemptionFlag = flag(argv, '--redemption-file') ?? env.RELAY_REDEMPTION_FILE;
+  const redemptionFile = redemptionFlag === undefined ? './.mtok-redemption.jsonl' : (redemptionFlag || null);
   // Optional payer screen for the contract-mode serve path (gates-to-classifiers
   // groundwork, #387): a comma-separated list of wallet
   // addresses this relay refuses to serve, checked against the VERIFIED DrawPaid

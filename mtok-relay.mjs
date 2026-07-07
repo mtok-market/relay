@@ -18,9 +18,10 @@
 // Usage:
 //   npx mtok-relay --offer <offerId> --model <id> --upstream <url> [--api <base>] [--port <n>] [--rpc <url>] [--settlement-pubkey <0x...>]
 //     [--out-price <usd/MTok>] [--in-price <usd/MTok>] [--redemption-file <path>] [--payer-denylist <a,b,c>]
-//   --redemption-file is STRONGLY recommended: it makes a paid draw serve exactly once
-//   across restarts (#495). Without it, redemption is in-memory only and a restart can
-//   re-serve one payment for a fresh inference (the relay warns at boot).
+//   Redemption is DURABLE BY DEFAULT (#568): a paid draw serves exactly once across restarts,
+//   with no flag needed (the default is ./.mtok-redemption.jsonl in the working dir). Override
+//   the path with --redemption-file / RELAY_REDEMPTION_FILE, or pass --redemption-file '' to
+//   force the old in-memory behavior (a restart can then re-serve a paid draw; the relay warns).
 
 import { readRelayConfig } from './src/config.mjs';
 import { startRelayServer } from './src/http.mjs';
