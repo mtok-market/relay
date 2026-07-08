@@ -77,7 +77,6 @@ export async function createRelayRuntime(config) {
       // does not have the prompt cannot produce a key that hits (and a forged
       // request would miss, then fail verifyDrawPaid's own requestHash check).
       const cacheKey = `${bookingId}:${n}:${requestHash}`;
-      if (served.has(cacheKey)) return send(res, 200, served.get(cacheKey));
 
       // Contract mode is the ONLY mode (#487): the legacy direct-transfer FUND
       // lane and its /api/bookings/:id balance read are gone. If the platform is
@@ -125,6 +124,7 @@ export async function createRelayRuntime(config) {
         // A broken screen hook fails CLOSED: do not serve on an unscreenable payer.
         return send(res, 403, { error: 'payer_denied', detail: 'payer screening failed: ' + e.message });
       }
+      if (served.has(cacheKey)) return send(res, 200, served.get(cacheKey));
       const paidEvent = paid.event;
       const remainingUsd = Number(paid.event.sellerUsdAtomic || 0) / 1e6;
       if (remainingUsd <= BALANCE_EPSILON) {
