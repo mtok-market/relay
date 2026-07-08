@@ -99,6 +99,11 @@ export async function createRelayRuntime(config) {
           requestHash,
           sellerWallet: config.settlementAddr,
           feeRecipient: platform.feeAddress,
+          // #580: refuse a payment older than the redemption window. served.has() is the
+          // primary one-serve guard, but it's pruned by age and lost on an in-memory restart;
+          // this on-chain age bound closes the re-serve hole those cases open (a stale replay
+          // buying a fresh inference). An honest retry is seconds-to-minutes old, never days.
+          maxPaidAgeMs: served.retentionMs,
         });
       } catch (e) {
         return send(res, 402, { error: 'payment_unverified', detail: e.message });

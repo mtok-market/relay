@@ -14,7 +14,7 @@ import fs from 'node:fs';
 // Retention (default 7d) bounds the file: an honest retry is seconds-to-minutes old,
 // so a replay a week after payment is not a real retry. There is no mid-session
 // eviction, the guard is authoritative for everything inside the window.
-const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function createRedemptionStore({ file = null, retentionMs = DEFAULT_RETENTION_MS, now = () => Date.now(), log = console } = {}) {
   const map = new Map(); // drawKey -> { payload, at }
@@ -48,6 +48,7 @@ export function createRedemptionStore({ file = null, retentionMs = DEFAULT_RETEN
 
   return {
     durable,
+    retentionMs, // the window this store is authoritative for; the runtime also uses it as the on-chain draw-age bound (#580).
     has(key) { return map.has(key); },
     get(key) { return map.get(key)?.payload; },
     set(key, payload) {

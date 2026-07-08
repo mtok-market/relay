@@ -97,6 +97,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
   // chunk/settlement is wrongly rejected as tx_not_found_or_pending. Retry the receipt
   // a few times before giving up. Bounded so a genuinely-missing tx still fails fast.
   receiptRetries = 3, receiptRetryMs = 700, sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)),
+  nowMs = () => Date.now(), // injectable clock for the optional draw-age guard (verifyDrawPaid maxPaidAgeMs).
 } = {}) {
   // Accept one URL, a comma-separated list, or an array — rpc() rotates across them
   // so a single rate-limited or down RPC can't strand a settlement verification (#108).
@@ -178,7 +179,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
     for (let i = 0; i < logs.length; i++) {
       if (consumed && consumed.has(i)) continue;
       const l = logs[i];
-      if (lc(l.address) !== usdc || l.topics?.[0] !== TRANSFER_TOPIC || l.topics.length !== 3) continue;
+      if (lc(l.address) !== usdc || lc(l.topics?.[0]) !== TRANSFER_TOPIC || l.topics.length !== 3) continue;
       if (topicToAddress(l.topics[2]) !== want) continue;
       if (wantFrom && topicToAddress(l.topics[1]) !== wantFrom) continue;
       sawRecipient = true;
@@ -217,6 +218,13 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       sellerWallet,
       feeRecipient,
       minSellerAtomic = 0n,
+      // Optional draw-age guard (#580). A DrawPaid receipt is a PERMANENT chain fact, so a
+      // buyer who holds the request preimage can replay the same /chunk body long after
+      // paying; if the relay's local redemption record was pruned (retention lapse) or lost
+      // (in-memory restart), served.has() misses and a stale payment buys a fresh inference.
+      // When set, refuse a payment whose block is older than maxPaidAgeMs: a legitimate
+      // first-serve or honest retry happens seconds-to-minutes after payDraw, never days.
+      maxPaidAgeMs,
     } = {}) {
       if (!(await assertChain())) return { ok: false, reason: 'wrong_chain' };
       const contract = lc(contractAddress);
@@ -224,14 +232,35 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       const got = await fetchReceipt(txHash);
       if (got.error) return { ok: false, reason: got.error };
 
-      const log = (got.receipt.logs || []).find((l) =>
+      const drawLogs = (got.receipt.logs || []).filter((l) =>
         lc(l.address) === contract
         && isDrawPaidTopic(l.topics?.[0])
       );
-      if (!log) return { ok: false, reason: 'no_draw_paid_event' };
+      if (!drawLogs.length) return { ok: false, reason: 'no_draw_paid_event' };
 
-      let event;
-      try { event = decodeDrawPaidLog(log); } catch { return { ok: false, reason: 'malformed_draw_paid_event' }; }
+      // A single tx can carry MORE than one DrawPaid (a smart-contract buyer wallet that
+      // batches payDraw calls). Pick the log matching THIS draw's identity (bookingId + n)
+      // rather than the first: otherwise draw #2's fields get checked against draw #1's log
+      // and a fully-paid draw reads as booking_mismatch after the money already moved.
+      let event = null;
+      let matchedLog = null;
+      let sawDecodable = false;
+      for (const l of drawLogs) {
+        let e;
+        try { e = decodeDrawPaidLog(l); } catch { continue; }
+        sawDecodable = true;
+        if (bookingId != null && e.bookingId !== String(bookingId)) continue;
+        if (n != null && e.n !== Number(n)) continue;
+        event = e; matchedLog = l;
+        break;
+      }
+      if (!event) {
+        // Nothing matched (bookingId, n). If nothing even decoded, it's malformed; else fall
+        // back to the first decodable log so the field checks below still return a precise
+        // mismatch reason (back-compat for callers that omit bookingId/n).
+        if (!sawDecodable) return { ok: false, reason: 'malformed_draw_paid_event' };
+        for (const l of drawLogs) { try { event = decodeDrawPaidLog(l); matchedLog = l; break; } catch { /* keep looking */ } }
+      }
       if (buyerAgentId != null && event.buyerAgentId !== String(buyerAgentId)) return { ok: false, reason: 'buyer_agent_mismatch' };
       if (sellerAgentId != null && event.sellerAgentId !== String(sellerAgentId)) return { ok: false, reason: 'seller_agent_mismatch' };
       if (bookingId != null && event.bookingId !== String(bookingId)) return { ok: false, reason: 'booking_mismatch' };
@@ -240,6 +269,24 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       if (n != null && event.n !== Number(n)) return { ok: false, reason: 'draw_n_mismatch' };
       if (requestHash != null && lc(event.requestHash) !== lc(requestHash)) return { ok: false, reason: 'request_hash_mismatch' };
       if (BigInt(event.sellerUsdAtomic) < BigInt(minSellerAtomic)) return { ok: false, reason: 'amount_too_low' };
+
+      // #580 draw-age guard: refuse a payment older than maxPaidAgeMs so a stale replay
+      // can't buy a fresh serve after the relay's local redemption record lapsed or was
+      // lost. Fail CLOSED on an unreadable block (the receipt just read fine on this same
+      // RPC pool, so this is a money guard, not a liveness knob). Opt-in: unset => no
+      // extra RPC, exact current behavior.
+      const maxAge = Number(maxPaidAgeMs);
+      if (Number.isFinite(maxAge) && maxAge > 0) {
+        const bn = matchedLog?.blockNumber;
+        if (bn == null) return { ok: false, reason: 'paid_block_unknown' };
+        let paidAtMs;
+        try {
+          const blockTag = (typeof bn === 'string' && bn.startsWith('0x')) ? bn : '0x' + BigInt(bn).toString(16);
+          const block = await rpc('eth_getBlockByNumber', [blockTag, false]);
+          paidAtMs = Number(BigInt(block.timestamp)) * 1000;
+        } catch { return { ok: false, reason: 'paid_block_unreadable' }; }
+        if (nowMs() - paidAtMs > maxAge) return { ok: false, reason: 'payment_too_old' };
+      }
 
       // #(fable review): bind each leg's `from` to the pay-time buyer (event.buyer,
       // emitted on v2; undefined on v1 -> no from-check, backward-compatible), and
