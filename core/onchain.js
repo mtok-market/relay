@@ -272,20 +272,28 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
 
       // #580 draw-age guard: refuse a payment older than maxPaidAgeMs so a stale replay
       // can't buy a fresh serve after the relay's local redemption record lapsed or was
-      // lost. Fail CLOSED on an unreadable block (the receipt just read fine on this same
-      // RPC pool, so this is a money guard, not a liveness knob). Opt-in: unset => no
-      // extra RPC, exact current behavior.
+      // lost. This is DEFENSE-IN-DEPTH on top of the relay's served.has() one-serve guard,
+      // so it only REJECTS when it actually reads an age past the bound. If the paid block
+      // can't be read (missing blockNumber, or a transient RPC failure even after retries),
+      // it SKIPS the freshness check rather than reject: the payment was already fully
+      // verified above, and rejecting would make the SDK auto-DISPUTE a good draw over an RPC
+      // blip, burning an honest buyer's USDC and busting an innocent seller's reputation.
+      // Opt-in: unset => no extra RPC, exact current behavior.
       const maxAge = Number(maxPaidAgeMs);
       if (Number.isFinite(maxAge) && maxAge > 0) {
         const bn = matchedLog?.blockNumber;
-        if (bn == null) return { ok: false, reason: 'paid_block_unknown' };
-        let paidAtMs;
-        try {
+        let paidAtMs = null;
+        if (bn != null) {
           const blockTag = (typeof bn === 'string' && bn.startsWith('0x')) ? bn : '0x' + BigInt(bn).toString(16);
-          const block = await rpc('eth_getBlockByNumber', [blockTag, false]);
-          paidAtMs = Number(BigInt(block.timestamp)) * 1000;
-        } catch { return { ok: false, reason: 'paid_block_unreadable' }; }
-        if (nowMs() - paidAtMs > maxAge) return { ok: false, reason: 'payment_too_old' };
+          for (let i = 0; i <= receiptRetries; i++) {
+            try {
+              const block = await rpc('eth_getBlockByNumber', [blockTag, false]);
+              if (block?.timestamp != null) { paidAtMs = Number(BigInt(block.timestamp)) * 1000; break; }
+            } catch { /* transient: fall through to retry */ }
+            if (i < receiptRetries) await sleepImpl(receiptRetryMs);
+          }
+        }
+        if (paidAtMs != null && nowMs() - paidAtMs > maxAge) return { ok: false, reason: 'payment_too_old' };
       }
 
       // #(fable review): bind each leg's `from` to the pay-time buyer (event.buyer,
