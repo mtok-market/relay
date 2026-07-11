@@ -190,8 +190,10 @@ export async function createRelayRuntime(config) {
           sellerWallet: config.settlementAddr,
           feeRecipient: platform.feeAddress,
           // #580: refuse a payment older than the redemption window. The JSONL
-          // payload cache is compacted by age (exclusive claim markers remain
-          // fail-closed), and an honest retry is seconds-to-minutes old, never days.
+          // payload cache AND the claim markers are both aged out at boot (#600),
+          // so past retention this age bound is the sole replay defense (its
+          // skip-on-unreadable-block residual is named in redemption.mjs). An
+          // honest retry is seconds-to-minutes old, never days.
           maxPaidAgeMs: served.retentionMs,
         });
       } catch (e) {

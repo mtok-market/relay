@@ -83,6 +83,22 @@ export function createRedemptionStore({ file = null, retentionMs = DEFAULT_RETEN
         fs.rmSync(compact, { force: true });
       }
       fs.mkdirSync(claimsDir, { recursive: true });
+      // ponytail: boot-only marker compaction; a long-lived process accumulates
+      // markers until restart. Past the retention window the JSONL record has aged
+      // out and the runtime's #580 maxPaidAgeMs bound refuses payments that old, so
+      // the marker is normally redundant. Named residual (#600, accepted): the #580
+      // age read SKIPS on an unreadable paid block (RPC blip), so a stale replay that
+      // lands in that blip after a restart can buy ONE extra bounded serve per draw.
+      // boundServe caps the damage; closing it would refuse honest fresh draws on the
+      // same blip, which is worse. Anything younger than retention stays untouched.
+      // Wall clock deliberately, not the injected now(): mtimes are wall clock.
+      const markerCutoff = Date.now() - retentionMs;
+      for (const name of fs.readdirSync(claimsDir)) {
+        try {
+          const marker = `${claimsDir}/${name}`;
+          if (fs.statSync(marker).mtimeMs < markerCutoff) fs.unlinkSync(marker);
+        } catch { /* a raced or unreadable marker just waits for the next boot */ }
+      }
       durable = true;
       seenVersion = fileVersion();
       log.log?.(`mtok-relay: durable redemption at ${file} (${map.size} entries loaded)`);
@@ -106,8 +122,9 @@ export function createRedemptionStore({ file = null, retentionMs = DEFAULT_RETEN
     if (!durable) throw new Error('durable redemption unavailable');
     const marker = markerFor(key);
     try {
-      // ponytail: permanent per-draw markers trade bounded inode growth for a
-      // stdlib-only interprocess CAS; replace with a transactional store if scale requires it.
+      // ponytail: per-draw markers are a stdlib-only interprocess CAS; the boot
+      // sweep above ages them out past retention. Replace with a transactional
+      // store if scale requires it.
       syncWrite(marker, 'wx', String(key) + '\n');
       return true;
     } catch (e) {
