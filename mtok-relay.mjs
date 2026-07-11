@@ -16,12 +16,12 @@
 //   MTOK_API_KEY      unused since #487 (accepted for backward compat only)
 //
 // Usage:
-//   npx mtok-relay --offer <offerId> --model <id> --upstream <url> [--api <base>] [--port <n>] [--rpc <url>] [--settlement-pubkey <0x...>]
+//   npx mtok-relay --offer <offerId> --model <id> --upstream <url> --out-price <usd/MTok> [--in-price <usd/MTok>] [--api <base>] [--port <n>] [--rpc <url>] [--settlement-pubkey <0x...>]
 //     [--out-price <usd/MTok>] [--in-price <usd/MTok>] [--redemption-file <path>] [--payer-denylist <a,b,c>]
-//   Redemption is DURABLE BY DEFAULT (#568): a paid draw serves exactly once across restarts,
-//   with no flag needed (the default is ./.mtok-redemption.jsonl in the working dir). Override
-//   the path with --redemption-file / RELAY_REDEMPTION_FILE, or pass --redemption-file '' to
-//   force the old in-memory behavior (a restart can then re-serve a paid draw; the relay warns).
+//   Redemption is DURABLE BY DEFAULT (#568): a paid draw attempts upstream at most once across
+//   restarts, with no flag needed (the default is ./.mtok-redemption.jsonl in the working dir).
+//   Override the path with --redemption-file / RELAY_REDEMPTION_FILE. An empty or unwritable
+//   path is rejected or fails closed before upstream spend.
 
 import { readRelayConfig } from './src/config.mjs';
 import { startRelayServer } from './src/http.mjs';

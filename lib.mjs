@@ -40,18 +40,20 @@ export function configuredFeeAtomic({ sellerUsdAtomic, feeAddress, feeBps }) {
   return (BigInt(sellerUsdAtomic || 0) * bps + 5000n) / 10000n;
 }
 
-// Estimate the input (prompt) token count from an OpenAI-style messages array.
-// Lean ~25% HIGH (3.2 chars/token vs the ~4 English avg) so the seller is
-// protected against under-counting the input leg. Pure, no I/O.
-export const CHARS_PER_TOKEN_EST = 3.2;
+// Conservative tokenizer-independent upper estimate: a tokenizer cannot consume
+// more text tokens than UTF-8 bytes, plus the chat envelope around each message.
+// The runtime accepts plain-text messages only, so no unpriced multimodal parts
+// can bypass this bound. Pure, dependency-free, no I/O.
+export const MESSAGE_OVERHEAD_TOKENS = 4;
 export function estimateInputTokens(messages) {
-  let chars = 0;
+  const utf8 = new TextEncoder();
+  let tokens = 3; // reply priming
   for (const m of messages ?? []) {
-    const c = m?.content;
-    if (typeof c === 'string') chars += c.length;
-    else if (Array.isArray(c)) for (const part of c) chars += String(part?.text ?? '').length;
+    tokens += MESSAGE_OVERHEAD_TOKENS;
+    tokens += utf8.encode(String(m?.role ?? '')).length;
+    tokens += utf8.encode(typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? null)).length;
   }
-  return Math.ceil(chars / CHARS_PER_TOKEN_EST);
+  return tokens;
 }
 
 // Bound a serve against the paid budget in BOTH legs (#495/#460). The relay used
@@ -64,10 +66,14 @@ export function estimateInputTokens(messages) {
 export function boundServe({ messages, budgetUsd, inPrice, outPrice, reqMax, contextCeil = 4096 }) {
   const estIn = estimateInputTokens(messages);
   const estInCostUsd = estIn * (Number(inPrice) > 0 ? Number(inPrice) : 0) / 1e6;
-  if (estInCostUsd >= budgetUsd) return { refuse: true, estIn, estInCostUsd };
+  if (estInCostUsd >= budgetUsd) return { refuse: true, reason: 'input', estIn, estInCostUsd };
   const outBudgetUsd = budgetUsd - estInCostUsd;
   let maxTok = contextCeil;
   if (Number(reqMax) > 0) maxTok = Math.min(maxTok, Math.floor(Number(reqMax)));
-  if (Number(outPrice) > 0) maxTok = Math.min(maxTok, Math.floor(outBudgetUsd / Number(outPrice) * 1e6));
-  return { refuse: false, maxTok: Math.max(1, maxTok), estIn, estInCostUsd };
+  if (!Number.isFinite(Number(outPrice)) || Number(outPrice) <= 0) {
+    return { refuse: true, reason: 'output_price', estIn, estInCostUsd };
+  }
+  maxTok = Math.min(maxTok, Math.floor(outBudgetUsd / Number(outPrice) * 1e6));
+  if (maxTok < 1) return { refuse: true, reason: 'output', estIn, estInCostUsd };
+  return { refuse: false, maxTok, estIn, estInCostUsd };
 }

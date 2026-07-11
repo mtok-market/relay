@@ -18,7 +18,7 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   // agent bound to the same wallet cannot be paid against this offer and served without the
   // fold attributing (and draining) the real offer. Optional for back-compat; recommended.
   const sellerAgentId = flag(argv, '--seller-agent');
-  const outPrice = Number(flag(argv, '--out-price') ?? 0);
+  const outPrice = Number(flag(argv, '--out-price'));
   // Input (prompt) price for the input-leg bound (#495/#460). Defaults to --out-price
   // so a seller who prices only output still bounds the input leg at a sane rate; the
   // serve also floors input at the buyer's committed event price so it can't be zeroed.
@@ -27,10 +27,11 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   // honest retry replays across restarts. DURABLE BY DEFAULT (#568): with no flag we still
   // point at a file in the working dir, so `npx mtok-relay` is safe out of the box instead of
   // the old in-memory footgun (a restart could re-serve a paid draw). Override with
-  // --redemption-file / RELAY_REDEMPTION_FILE; if the default path is not writable the store
-  // falls back to in-memory and warns loudly. Pass an empty string to force in-memory.
+  // --redemption-file / RELAY_REDEMPTION_FILE. An unwritable path fails closed
+  // before upstream spend; an explicitly empty path is rejected at startup.
   const redemptionFlag = flag(argv, '--redemption-file') ?? env.RELAY_REDEMPTION_FILE;
-  const redemptionFile = redemptionFlag === undefined ? './.mtok-redemption.jsonl' : (redemptionFlag || null);
+  if (redemptionFlag === '') throw new Error('--redemption-file cannot be empty; paid serves require durable redemption');
+  const redemptionFile = redemptionFlag === undefined ? './.mtok-redemption.jsonl' : redemptionFlag;
   // Optional payer screen for the contract-mode serve path (gates-to-classifiers
   // groundwork, #387): a comma-separated list of wallet
   // addresses this relay refuses to serve, checked against the VERIFIED DrawPaid
@@ -44,6 +45,12 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   if (!offerId) throw new Error('--offer <id> is required');
   if (!model) throw new Error('--model <id> is required (the offer model you serve)');
   if (!upstream) throw new Error('--upstream <url> is required');
+  if (!Number.isFinite(outPrice) || outPrice <= 0) {
+    throw new Error('--out-price <usd/MTok> is required and must be finite and positive');
+  }
+  if (!Number.isFinite(inPrice) || inPrice <= 0) {
+    throw new Error('--in-price <usd/MTok> must be finite and positive');
+  }
 
   // MTOK_API_KEY is retained ONLY for backward compat (#487): the chain-only relay
   // holds no platform secret. It no longer reports to the platform (POST /api/chunks/report

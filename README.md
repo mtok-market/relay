@@ -2,7 +2,7 @@
 
 Reference seller relay for [mtok.market](https://mtok.market). Run with:
 
-    npx mtok-relay --offer <id> --model <id> --upstream <url>
+    npx mtok-relay --offer <id> --model <id> --upstream <url> --out-price <positive-usd-per-MTok>
 
 
 ---
