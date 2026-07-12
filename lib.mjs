@@ -1,7 +1,16 @@
-// packages/relay/lib.mjs — pure, dependency-free helpers for a chain-only direct-tier
-// seller relay. No I/O. No imports. Use these to protect yourself before spending your
-// inference key: cap output to what the on-chain draw paid for, echo the real model,
-// and check the committed platform fee against the verified DrawPaid event.
+// packages/relay/lib.mjs, pure helpers for a chain-only direct-tier seller relay. The
+// serve-money guards (estimateInputTokens, boundServe, enforceModelEcho, configuredFeeAtomic)
+// moved into mtok-bridge's serve core (#603) so the node relay and the workers-ai house seller
+// run ONE code path; they are re-exported here for back-compat. What remains below is pure,
+// dependency-free, no I/O.
+
+export {
+  MESSAGE_OVERHEAD_TOKENS,
+  estimateInputTokens,
+  boundServe,
+  enforceModelEcho,
+  configuredFeeAtomic,
+} from './bridge/serve-core.mjs';
 
 /**
  * Output-token budget a chunk's USD price pays for, given the offer's output price
@@ -19,61 +28,8 @@ export const paidBudgetTokensFor = ({ chunkUsd, outputPricePerMTok }) =>
 export const capOutput = (requestedMax, paidBudgetTokens) =>
   Math.min(Number(requestedMax) || 0, Number(paidBudgetTokens) || 0);
 
-/**
- * Throws if the upstream model doesn't match the offer model.
- * Protects against cheap-swap accusations: echo the real model you delivered.
- */
-export function enforceModelEcho(upstreamModel, offerModel) {
-  if (String(upstreamModel) !== String(offerModel))
-    throw new Error(`model mismatch: upstream ${upstreamModel} != offer ${offerModel}`);
-}
-
 // NOTE: the legacy report builders (buildFundReport / buildDrawReport / requiresFeeLeg)
 // were removed with the chain-only collapse (#487): the platform deleted
 // POST /api/chunks/report, so the reference relay reports NOTHING. A buyer pays per
 // draw on-chain (MtokDripLedger) and the relay serves against the verified DrawPaid.
-// The fee is now checked on-chain against the event, via configuredFeeAtomic below.
-
-export function configuredFeeAtomic({ sellerUsdAtomic, feeAddress, feeBps }) {
-  const bps = BigInt(Math.trunc(Math.max(0, Number(feeBps) || 0)));
-  if (!feeAddress || bps === 0n) return 0n;
-  return (BigInt(sellerUsdAtomic || 0) * bps + 5000n) / 10000n;
-}
-
-// Conservative tokenizer-independent upper estimate: a tokenizer cannot consume
-// more text tokens than UTF-8 bytes, plus the chat envelope around each message.
-// The runtime accepts plain-text messages only, so no unpriced multimodal parts
-// can bypass this bound. Pure, dependency-free, no I/O.
-export const MESSAGE_OVERHEAD_TOKENS = 4;
-export function estimateInputTokens(messages) {
-  const utf8 = new TextEncoder();
-  let tokens = 3; // reply priming
-  for (const m of messages ?? []) {
-    tokens += MESSAGE_OVERHEAD_TOKENS;
-    tokens += utf8.encode(String(m?.role ?? '')).length;
-    tokens += utf8.encode(typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? null)).length;
-  }
-  return tokens;
-}
-
-// Bound a serve against the paid budget in BOTH legs (#495/#460). The relay used
-// to cap only OUTPUT, so a dust draw + a huge prompt got its output capped but the
-// whole prompt forwarded, making the seller eat unbounded upstream INPUT compute.
-// Estimate the input cost and REFUSE before any upstream call if it alone meets or
-// exceeds the payment; otherwise cap output over the budget LEFT after input. inPrice
-// and outPrice are USD per MTok. The estimate gates the refuse ONLY; real billing
-// still meters the upstream's reported token counts, so this never over-charges.
-export function boundServe({ messages, budgetUsd, inPrice, outPrice, reqMax, contextCeil = 4096 }) {
-  const estIn = estimateInputTokens(messages);
-  const estInCostUsd = estIn * (Number(inPrice) > 0 ? Number(inPrice) : 0) / 1e6;
-  if (estInCostUsd >= budgetUsd) return { refuse: true, reason: 'input', estIn, estInCostUsd };
-  const outBudgetUsd = budgetUsd - estInCostUsd;
-  let maxTok = contextCeil;
-  if (Number(reqMax) > 0) maxTok = Math.min(maxTok, Math.floor(Number(reqMax)));
-  if (!Number.isFinite(Number(outPrice)) || Number(outPrice) <= 0) {
-    return { refuse: true, reason: 'output_price', estIn, estInCostUsd };
-  }
-  maxTok = Math.min(maxTok, Math.floor(outBudgetUsd / Number(outPrice) * 1e6));
-  if (maxTok < 1) return { refuse: true, reason: 'output', estIn, estInCostUsd };
-  return { refuse: false, maxTok, estIn, estInCostUsd };
-}
+// The fee is checked on-chain against the event, via configuredFeeAtomic above.

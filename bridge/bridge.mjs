@@ -4,6 +4,10 @@
 // later, the market relay on top) adapts its req/res to them. The market layer (on-chain verify,
 // fee, redemption, discovery) is a SEPARATE wrapper that calls the same serveChat guts; it is not
 // in here. (#566)
+//
+// The PAID-serve state machine those market hosts share lives in serve-core.mjs (#603) and is
+// re-exported here so `import { createServeCore } from 'mtok-bridge'` just works.
+export * from './serve-core.mjs';
 
 // Bearer-key auth. No key configured (null/'') = OPEN on purpose (keyless mode is an explicit
 // opt-in the CLI announces loudly). A configured key must match exactly.
