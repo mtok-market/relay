@@ -119,20 +119,36 @@ export function configuredFeeAtomic({ sellerUsdAtomic, feeAddress, feeBps }) {
   return (BigInt(sellerUsdAtomic || 0) * bps + 5000n) / 10000n;
 }
 
-// Conservative tokenizer-independent upper estimate: a tokenizer cannot consume
-// more text tokens than UTF-8 bytes, plus the chat envelope around each message.
-// The core accepts plain-text messages only, so no unpriced multimodal parts
-// can bypass this bound. Pure, dependency-free, no I/O.
+// Tokenizer-independent input estimate, byte-aware with a safety margin.
+//
+// #626: this used to count one token per UTF-8 byte, i.e. a true worst-case
+// bound (a tokenizer cannot emit more text tokens than bytes). That bound is
+// correct and roughly 4x too pessimistic for real text, and the over-estimate
+// is NOT free: boundServe refuses a draw whose estimated input cost alone meets
+// the payment, and that refusal happens AFTER the buyer has paid on chain. A
+// real buyer sending a ~4KB prompt on a budget that comfortably covered it was
+// refused every night for two weeks and auto-disputed, silently.
+//
+// So estimate realistically and keep the margin explicit. BYTES_PER_TOKEN_EST
+// of 3.2 is the English average (~4 bytes/token) with ~25% headroom, and
+// staying in BYTES rather than characters keeps multibyte prompts from reading
+// artificially cheap. The seller's residual exposure when an estimate lands
+// low is bounded: actual usage is metered from the upstream response after the
+// serve, and the output cap is computed from whatever budget the input
+// estimate left, so an under-estimate eats into output headroom rather than
+// running unpriced.
 export const MESSAGE_OVERHEAD_TOKENS = 4;
+export const BYTES_PER_TOKEN_EST = 3.2;
 export function estimateInputTokens(messages) {
   const utf8 = new TextEncoder();
-  let tokens = 3; // reply priming
+  let bytes = 0;
+  let envelope = 3; // reply priming
   for (const m of messages ?? []) {
-    tokens += MESSAGE_OVERHEAD_TOKENS;
-    tokens += utf8.encode(String(m?.role ?? '')).length;
-    tokens += utf8.encode(typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? null)).length;
+    envelope += MESSAGE_OVERHEAD_TOKENS;
+    bytes += utf8.encode(String(m?.role ?? '')).length;
+    bytes += utf8.encode(typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? null)).length;
   }
-  return tokens;
+  return envelope + Math.ceil(bytes / BYTES_PER_TOKEN_EST);
 }
 
 // Bound a serve against the paid budget in BOTH legs (#495/#460). The relay used

@@ -1,6 +1,6 @@
 {
   "name": "mtok-relay",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Reference seller relay for mtok.market — accepts on-chain-prepaid chunk draws and serves inference from an upstream you control.",
   "type": "module",
   "bin": {
