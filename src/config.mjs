@@ -42,6 +42,16 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
     .map((a) => a.trim().toLowerCase())
     .filter(Boolean);
 
+  // #654: per-relay output-token sanity ceiling. The paid budget already bounds
+  // output, so this only caps a single generation (e.g. a no-max_tokens request on
+  // a large budget). Operators serving large-context upstreams raise it; unset =>
+  // the shared generous default in mtok-bridge's boundServe.
+  const maxOutputRaw = flag(argv, '--max-output-tokens') ?? env.RELAY_MAX_OUTPUT_TOKENS;
+  const maxOutputTokens = maxOutputRaw != null ? Number(maxOutputRaw) : undefined;
+  if (maxOutputTokens != null && (!Number.isFinite(maxOutputTokens) || maxOutputTokens < 1)) {
+    throw new Error('--max-output-tokens must be a positive integer');
+  }
+
   if (!offerId) throw new Error('--offer <id> is required');
   if (!model) throw new Error('--model <id> is required (the offer model you serve)');
   if (!upstream) throw new Error('--upstream <url> is required');
@@ -89,5 +99,6 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
     upstreamKey,
     settlementAddr,
     payerDenylist,
+    maxOutputTokens,
   };
 }

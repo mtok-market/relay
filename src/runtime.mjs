@@ -12,6 +12,37 @@ export async function createRelayRuntime(config) {
   const served = createRedemptionStore({ file: config.redemptionFile, log: config.log });
   const drawLocks = new Map();
   const platform = await fetchPlatformConfig(config);
+  // #651/#654: a relay is a long-running process, so the platform FEE RATE it
+  // enforces must track a fee DECREASE, or a stale higher boot rate over-demands
+  // and refuses an already-paid draw (fee_amount_too_low) even though the buyer
+  // paid the current lower floor. Refresh feeBps on a short TTL (best effort: a
+  // fetch failure keeps the last-known value). The fee-floor uses min(boot, current)
+  // (see the getter below), so a change in EITHER direction never strands an honest
+  // draw: the relay demands no more than the most lenient of the two rates.
+  //
+  // The fee RECIPIENT is deliberately NOT refreshed (codex review): the verifier
+  // matches the fee transfer against an EXACT address, so tracking a live address
+  // change would refuse draws whose fee went to the address the buyer read at
+  // payment time. A recipient change is a rare, coordinated treasury migration that
+  // rides a relay restart; pinning the boot address is the safe status quo.
+  const bootFeeBps = platform.feeBps;
+  const FEE_REFRESH_MS = 60_000;
+  let lastConfigFetch = Date.now();
+  const refreshPlatformFee = async () => {
+    lastConfigFetch = Date.now();
+    try {
+      const fresh = await fetchPlatformConfig(config);
+      platform.feeBps = fresh.feeBps;
+      return true;
+    } catch (e) {
+      (config.log ?? console).error?.(`mtok relay: platform config refresh failed (${e.message}); keeping last-known fee rate`);
+      return false;
+    }
+  };
+  const refreshPlatformFeeIfStale = async () => {
+    if (Date.now() - lastConfigFetch < FEE_REFRESH_MS) return;
+    await refreshPlatformFee();
+  };
   // Pin the chain (codex #566 review): the verifier supports expectedChainId + a wrong_chain
   // guard, but the relay was not passing it, so a relay pointed at a wrong or spoofed --rpc could
   // accept a receipt from another chain and spend upstream against a payment that never landed on
@@ -58,8 +89,13 @@ export async function createRelayRuntime(config) {
     sellerAgentId: config.sellerAgentId,
     sellerWallet: config.settlementAddr,
     dripContractAddress: platform.dripContractAddress,
+    // #654: the fee floor is min(boot, current) so neither a fee increase nor a
+    // decrease can over-demand and strand an honest already-paid draw; the recipient
+    // stays pinned to the boot address (exact-match verify, see the note above).
     feeRecipient: platform.feeAddress,
-    feeBps: platform.feeBps,
+    feeBps: () => Math.min(bootFeeBps, platform.feeBps),
+    // #654: per-relay output sanity ceiling (unset => the shared generous default).
+    maxOutputTokens: config.maxOutputTokens,
     screenPayer: payerDenied,
   });
 
@@ -80,7 +116,17 @@ export async function createRelayRuntime(config) {
 
   const handleDraw = (body, res) =>
     withBookingLock(String(body?.bookingId ?? ''), async () => {
-      const out = await core.serve(body);
+      await refreshPlatformFeeIfStale(); // #651: track platform fee changes before the fee-floor check
+      let out = await core.serve(body);
+      // #654 (codex review): a fee DECREASE that landed inside the current TTL window
+      // (before the periodic refresh picked it up) makes the fee-floor over-demand and
+      // refuse an already-paid draw as fee_amount_too_low, which the SDK then DISPUTES.
+      // The fee check runs before any claim or upstream spend, so on exactly that
+      // refusal, force a config refresh and retry once -- closing the window so an
+      // honest draw is never disputed over a stale fee rate.
+      if (out.status === 402 && out.body?.detail === 'fee_amount_too_low' && await refreshPlatformFee()) {
+        out = await core.serve(body);
+      }
       return send(res, out.status, out.body);
     });
 

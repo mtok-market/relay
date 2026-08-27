@@ -18,6 +18,7 @@
 // Usage:
 //   npx mtok-relay --offer <offerId> --model <id> --upstream <url> --out-price <usd/MTok> [--in-price <usd/MTok>] [--api <base>] [--port <n>] [--rpc <url>] [--settlement-pubkey <0x...>]
 //     [--out-price <usd/MTok>] [--in-price <usd/MTok>] [--redemption-file <path>] [--payer-denylist <a,b,c>]
+//     [--max-output-tokens <n> | RELAY_MAX_OUTPUT_TOKENS] (per-relay output ceiling; default is generous)
 //   Redemption is DURABLE BY DEFAULT (#568): a paid draw attempts upstream at most once across
 //   restarts, with no flag needed (the default is ./.mtok-redemption.jsonl in the working dir).
 //   Override the path with --redemption-file / RELAY_REDEMPTION_FILE. An empty or unwritable

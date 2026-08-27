@@ -105,11 +105,53 @@ function validateRequest(request, model, { legacy = false } = {}) {
 }
 
 /**
- * Throws if the upstream model doesn't match the offer model.
- * Protects against cheap-swap accusations: echo the real model you delivered.
+ * Normalize a model id for comparison: lowercase, drop any provider namespace
+ * (everything through the last '/', e.g. `@cf/meta/`), and strip a leading '@'.
+ * `@cf/meta/llama-3.1-8b-instruct-fp8` and `llama-3.1-8b-instruct-fp8` normalize
+ * to the same stem.
+ */
+export function normalizeModelId(m) {
+  return String(m ?? '').toLowerCase().split('/').pop().replace(/^@/, '');
+}
+
+/**
+ * True when the upstream's echoed model is a legitimate variant of the offer
+ * model. Legitimate variance is ONLY a resolved version/snapshot SUFFIX appended
+ * to the same base (`gpt-4o` -> `gpt-4o-2024-08-06`, `gpt-4` -> `gpt-4-0613`): the
+ * extra segment starts with a DIGIT. A raw prefix match is NOT enough -- model
+ * families share alphabetic prefixes (`gpt-4` is a prefix of the CHEAPER
+ * `gpt-4o-mini`; `claude-3` of `claude-3-haiku`), so accepting any prefix would
+ * pass a cheap-swap. Require the appended segment to be version-like (digit-led),
+ * which distinguishes a snapshot date/version from a different model qualifier
+ * (mini, haiku, turbo, fp8, instruct).
+ */
+export function modelsCompatible(upstreamModel, offerModel) {
+  const a = normalizeModelId(upstreamModel);
+  const b = normalizeModelId(offerModel);
+  if (!a || !b) return false;
+  if (a === b) return true;
+  // The longer must equal the shorter + a version/snapshot suffix made ONLY of
+  // digit groups separated by -/./_ (a date like -2024-08-06, a build like -0613,
+  // a point version like .1). Any alphabetic segment in the suffix means a
+  // different model qualifier (mini, haiku, turbo, instruct, fp8), so e.g.
+  // gpt-4.1-mini vs gpt-4 and claude-3.5-haiku vs claude-3 are rejected while a
+  // real snapshot passes.
+  const [longer, shorter] = a.length >= b.length ? [a, b] : [b, a];
+  if (!longer.startsWith(shorter)) return false;
+  const rest = longer.slice(shorter.length);
+  return /^([-._]\d+)+$/.test(rest);
+}
+
+/**
+ * Throws if the upstream model is NOT a legitimate variant of the offer model.
+ * #651: the old check was an exact string compare, which false-refused honest
+ * sellers whose OpenAI-compatible provider echoes a snapshot id or a namespace-
+ * stripped name (the buyer's own accept-check is exact too, so the seller then
+ * normalizes the delivered model to the offer id below). A real cheap-swap to a
+ * different model family still fails this tolerant relation.
  */
 export function enforceModelEcho(upstreamModel, offerModel) {
-  if (String(upstreamModel) !== String(offerModel))
+  if (!modelsCompatible(upstreamModel, offerModel))
     throw new Error(`model mismatch: upstream ${upstreamModel} != offer ${offerModel}`);
 }
 
@@ -158,7 +200,14 @@ export function estimateInputTokens(messages) {
 // exceeds the payment; otherwise cap output over the budget LEFT after input. inPrice
 // and outPrice are USD per MTok. The estimate gates the refuse ONLY; real billing
 // still meters the upstream's reported token counts, so this never over-charges.
-export function boundServe({ messages, budgetUsd, inPrice, outPrice, reqMax, contextCeil = 4096 }) {
+// #654: DEFAULT_MAX_OUTPUT_TOKENS is a generous sanity ceiling, not a money guard
+// (the paid budget below already bounds output, and billing meters real usage). The
+// old 4096 was low enough to cap honest large-output requests below what the buyer
+// funded, so they overpaid. A relay operator can raise or lower it per their upstream
+// (see createServeCore's maxOutputTokens); this default just keeps a no-max_tokens
+// request on a big budget from triggering one runaway generation.
+export const DEFAULT_MAX_OUTPUT_TOKENS = 32768;
+export function boundServe({ messages, budgetUsd, inPrice, outPrice, reqMax, contextCeil = DEFAULT_MAX_OUTPUT_TOKENS }) {
   const estIn = estimateInputTokens(messages);
   const estInCostUsd = estIn * (Number(inPrice) > 0 ? Number(inPrice) : 0) / 1e6;
   if (estInCostUsd >= budgetUsd) return { refuse: true, reason: 'input', estIn, estInCostUsd };
@@ -186,8 +235,20 @@ export function createServeCore({
   offerId, sellerAgentId, sellerWallet,
   dripContractAddress, feeRecipient, feeBps,
   screenPayer,
+  // #654: the output-token sanity ceiling for boundServe. The PAID budget already
+  // bounds output (and metering is on real usage), so this is a defensive cap on a
+  // single generation, not a money guard. It is a per-relay knob: the reference host
+  // passes MTOK_MAX_OUTPUT_TOKENS / a config value; operators serving large-context
+  // models raise it. Falls back to boundServe's own generous default when unset.
+  maxOutputTokens,
 }) {
   const serve = async (body) => {
+    // #651: feeBps/feeRecipient may be getters so a long-running relay tracks a
+    // platform fee change instead of pinning the boot rate (a fee DECREASE with a
+    // stale higher rate would refuse an already-paid draw as fee_amount_too_low).
+    // Resolve once per serve and use the resolved values everywhere below.
+    const currentFeeBps = typeof feeBps === 'function' ? feeBps() : feeBps;
+    const currentFeeRecipient = typeof feeRecipient === 'function' ? feeRecipient() : feeRecipient;
     const { bookingId, n, buyerId, request, requestNonce, drawPaidTxHash } = body;
     const hasRequestNonce = Object.hasOwn(body, 'requestNonce');
     if (!bookingId) return { status: 400, body: { error: 'bad_request', detail: 'DRAW needs bookingId' } };
@@ -233,7 +294,7 @@ export function createServeCore({
         n,
         requestHash,
         sellerWallet,
-        feeRecipient,
+        feeRecipient: currentFeeRecipient,
         // #580: refuse a payment older than the redemption window. The JSONL
         // payload cache AND the claim markers are both aged out at boot (#600),
         // so past retention this age bound is the sole replay defense (its
@@ -247,8 +308,8 @@ export function createServeCore({
     if (!paid?.ok) return { status: 402, body: { error: 'payment_unverified', detail: paid?.reason || 'unknown' } };
     const expectedFee = configuredFeeAtomic({
       sellerUsdAtomic: paid.event.sellerUsdAtomic,
-      feeAddress: feeRecipient,
-      feeBps,
+      feeAddress: currentFeeRecipient,
+      feeBps: currentFeeBps,
     });
     if (BigInt(paid.event.feeUsdAtomic || 0) < expectedFee) {
       return { status: 402, body: { error: 'payment_unverified', detail: 'fee_amount_too_low' } };
@@ -306,7 +367,7 @@ export function createServeCore({
     const eventOutPriceUsd = Number(paidEvent.outputPricePerMTokAtomic || 0) / 1e6;
     const boundInPrice = Math.max(Number(inPrice) || 0, eventInPriceUsd);
     const boundOutPrice = Math.max(Number(outPrice) || 0, eventOutPriceUsd);
-    const bound = boundServe({ messages: checked.safeRequest.messages, budgetUsd: remainingUsd, inPrice: boundInPrice, outPrice: boundOutPrice, reqMax: checked.safeRequest.max_tokens });
+    const bound = boundServe({ messages: checked.safeRequest.messages, budgetUsd: remainingUsd, inPrice: boundInPrice, outPrice: boundOutPrice, reqMax: checked.safeRequest.max_tokens, ...(Number(maxOutputTokens) > 0 ? { contextCeil: Math.floor(Number(maxOutputTokens)) } : {}) });
     if (bound.refuse) {
       const error = bound.reason === 'input' ? 'input_too_large' : 'output_unfunded';
       return { status: 402, body: { error, detail: `estimated input (~${bound.estIn} tokens, $${bound.estInCostUsd.toFixed(6)}) leaves no safely funded output in the paid amount ($${remainingUsd})`, _bookingId: bookingId, remainingUsd } };
@@ -332,6 +393,11 @@ export function createServeCore({
 
     try { enforceModelEcho(completion.model, model); }
     catch (e) { return { status: 502, body: { error: 'model_mismatch', detail: e.message } }; }
+    // #651: the upstream model passed the tolerant variant check; echo the OFFER
+    // model id in the delivered completion. The buyer's accept-check is an exact
+    // completion.model === offer.model compare, so a legitimate snapshot/namespace
+    // variant must be normalized to the offer id or an honest paid draw is disputed.
+    if (completion && typeof completion === 'object') completion.model = model;
 
     // ── Contract mode is REPORT-FREE (chain-native phase 2 stage 3, #387) ──
     // The verified DrawPaid event IS the record: the platform indexes the

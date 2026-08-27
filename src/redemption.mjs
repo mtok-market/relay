@@ -164,7 +164,19 @@ export function createRedemptionStore({ file = null, retentionMs = DEFAULT_RETEN
       if (map.has(key)) return false;
       if (!markClaimed(markerKey)) return false;
       const entry = { state: 'pending', at: now() };
-      append(key, entry); // persist before exposing the claim to the runtime
+      try {
+        append(key, entry); // persist before exposing the claim to the runtime
+      } catch (e) {
+        // #654: the exclusive marker landed but the pending record did not (disk
+        // full, momentarily unwritable JSONL). Without undoing the marker, every
+        // retry sees no record, re-verifies payment, then hits EEXIST on markClaimed
+        // and returns 409 draw_pending FOREVER -- an already-paid draw stranded with
+        // no completion, recoverable only by hand. Unlink the orphaned marker (no
+        // upstream ran: append precedes both map.set and any upstream call), so a
+        // retry can re-claim and serve. Then rethrow: this attempt still fails closed.
+        if (durable) { try { fs.unlinkSync(markerFor(markerKey)); } catch { /* best effort */ } }
+        throw e;
+      }
       map.set(key, entry);
       return true;
     },
