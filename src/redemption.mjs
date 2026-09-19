@@ -86,11 +86,9 @@ export function createRedemptionStore({ file = null, retentionMs = DEFAULT_RETEN
       // ponytail: boot-only marker compaction; a long-lived process accumulates
       // markers until restart. Past the retention window the JSONL record has aged
       // out and the runtime's #580 maxPaidAgeMs bound refuses payments that old, so
-      // the marker is normally redundant. Named residual (#600, accepted): the #580
-      // age read SKIPS on an unreadable paid block (RPC blip), so a stale replay that
-      // lands in that blip after a restart can buy ONE extra bounded serve per draw.
-      // boundServe caps the damage; closing it would refuse honest fresh draws on the
-      // same blip, which is worse. Anything younger than retention stays untouched.
+      // the marker is redundant. An unreadable payment timestamp refuses new work
+      // with retryable payment_age_unavailable; it never grants another serve.
+      // Anything younger than retention stays untouched.
       // Wall clock deliberately, not the injected now(): mtimes are wall clock.
       const markerCutoff = Date.now() - retentionMs;
       for (const name of fs.readdirSync(claimsDir)) {

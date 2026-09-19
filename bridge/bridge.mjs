@@ -55,7 +55,7 @@ export async function serveChat({ body, authHeader, apiKey, models, upstream }) 
 // `baseUrl` is the API root (e.g. https://api.openai.com/v1 or a local model server); `key` is
 // its bearer token (optional for a keyless local server). This is what makes the bridge portable:
 // point it at a provider, or at ollama / LM Studio / vLLM on localhost.
-export function httpUpstream({ baseUrl, key }) {
+export function httpUpstream({ baseUrl, key, timeoutMs }) {
   const url = String(baseUrl || '').replace(/\/$/, '') + '/chat/completions';
   return async (payload) => {
     const res = await fetch(url, {
@@ -65,6 +65,7 @@ export function httpUpstream({ baseUrl, key }) {
         ...(key ? { authorization: `Bearer ${key}` } : {}),
       },
       body: JSON.stringify(payload),
+      ...(timeoutMs == null ? {} : { signal: AbortSignal.timeout(timeoutMs) }),
     });
     const text = await res.text();
     let json;

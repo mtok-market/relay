@@ -98,6 +98,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
   // a few times before giving up. Bounded so a genuinely-missing tx still fails fast.
   receiptRetries = 3, receiptRetryMs = 700, sleepImpl = (ms) => new Promise((r) => setTimeout(r, ms)),
   nowMs = () => Date.now(), // injectable clock for the optional draw-age guard (verifyDrawPaid maxPaidAgeMs).
+  rpcTimeoutMs = 5000,
 } = {}) {
   // Accept one URL, a comma-separated list, or an array — rpc() rotates across them
   // so a single rate-limited or down RPC can't strand a settlement verification (#108).
@@ -110,6 +111,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: AbortSignal.timeout(rpcTimeoutMs),
     });
     if (!res.ok) throw apiError(502, 'rpc_error', `chain RPC returned ${res.status}`);
     const body = await res.json();
@@ -145,12 +147,14 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
   async function assertChain() {
     if (!chainPinned) return true; // no (valid) expected chain configured -> today's behavior
     if (chainOkUrls.size) return true; // already found at least one on-chain url (cached)
+    let timeout;
     for (const url of urls) {
       try {
         const hex = await rpcOn(url, 'eth_chainId', []);
         if (typeof hex === 'string' && parseInt(hex, 16) === expChain) chainOkUrls.add(url);
-      } catch { /* transient / wrong-chain: leave it out, don't cache a failure */ }
+      } catch (error) { if (error.name === 'TimeoutError') timeout = error; }
     }
+    if (!chainOkUrls.size && timeout) throw timeout;
     return chainOkUrls.size > 0;
   }
 
@@ -270,30 +274,30 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       if (requestHash != null && lc(event.requestHash) !== lc(requestHash)) return { ok: false, reason: 'request_hash_mismatch' };
       if (BigInt(event.sellerUsdAtomic) < BigInt(minSellerAtomic)) return { ok: false, reason: 'amount_too_low' };
 
-      // #580 draw-age guard: refuse a payment older than maxPaidAgeMs so a stale replay
-      // can't buy a fresh serve after the relay's local redemption record lapsed or was
-      // lost. This is DEFENSE-IN-DEPTH on top of the relay's served.has() one-serve guard,
-      // so it only REJECTS when it actually reads an age past the bound. If the paid block
-      // can't be read (missing blockNumber, or a transient RPC failure even after retries),
-      // it SKIPS the freshness check rather than reject: the payment was already fully
-      // verified above, and rejecting would make the SDK auto-DISPUTE a good draw over an RPC
-      // blip, burning an honest buyer's USDC and busting an innocent seller's reputation.
-      // Opt-in: unset => no extra RPC, exact current behavior.
+      // Once redemption records expire, verified payment age is the replay boundary.
+      // An unreadable timestamp is retryable uncertainty, never permission to spend.
       const maxAge = Number(maxPaidAgeMs);
       if (Number.isFinite(maxAge) && maxAge > 0) {
-        const bn = matchedLog?.blockNumber;
+        const bn = matchedLog?.blockNumber ?? got.receipt.blockNumber;
         let paidAtMs = null;
         if (bn != null) {
-          const blockTag = (typeof bn === 'string' && bn.startsWith('0x')) ? bn : '0x' + BigInt(bn).toString(16);
           for (let i = 0; i <= receiptRetries; i++) {
             try {
+              const blockTag = '0x' + BigInt(bn).toString(16);
               const block = await rpc('eth_getBlockByNumber', [blockTag, false]);
-              if (block?.timestamp != null) { paidAtMs = Number(BigInt(block.timestamp)) * 1000; break; }
+              if (block?.timestamp != null) {
+                const timestamp = Number(BigInt(block.timestamp)) * 1000;
+                if (Number.isSafeInteger(timestamp) && timestamp >= 0 && timestamp <= nowMs() + 60_000) {
+                  paidAtMs = timestamp;
+                  break;
+                }
+              }
             } catch { /* transient: fall through to retry */ }
             if (i < receiptRetries) await sleepImpl(receiptRetryMs);
           }
         }
-        if (paidAtMs != null && nowMs() - paidAtMs > maxAge) return { ok: false, reason: 'payment_too_old' };
+        if (paidAtMs == null) return { ok: false, reason: 'payment_age_unavailable' };
+        if (nowMs() - paidAtMs > maxAge) return { ok: false, reason: 'payment_too_old' };
       }
 
       // #(fable review): bind each leg's `from` to the pay-time buyer (event.buyer,

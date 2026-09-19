@@ -1,4 +1,5 @@
 import { privateKeyToAccount } from 'viem/accounts';
+import { isIP } from 'node:net';
 
 const flag = (args, name) => {
   const i = args.indexOf(name);
@@ -51,6 +52,15 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   if (maxOutputTokens != null && (!Number.isFinite(maxOutputTokens) || maxOutputTokens < 1)) {
     throw new Error('--max-output-tokens must be a positive integer');
   }
+  const trustedProxies = String(env.RELAY_TRUSTED_PROXIES ?? '').split(',').map(value => value.trim()).filter(Boolean);
+  if (trustedProxies.some(value => !isIP(value) || value.includes('%'))) throw new Error('RELAY_TRUSTED_PROXIES must contain exact IP addresses');
+  const clientIpHeader = String(env.RELAY_CLIENT_IP_HEADER ?? 'cf-connecting-ip').toLowerCase();
+  if (!/^[a-z0-9-]+$/.test(clientIpHeader)) throw new Error('RELAY_CLIENT_IP_HEADER must be a header name');
+  const maxConcurrentRequests = Number(env.RELAY_MAX_CONCURRENT_REQUESTS ?? 64);
+  const upstreamTimeoutMs = Number(env.RELAY_UPSTREAM_TIMEOUT_MS ?? 120_000);
+  for (const [name, value] of Object.entries({ RELAY_MAX_CONCURRENT_REQUESTS: maxConcurrentRequests, RELAY_UPSTREAM_TIMEOUT_MS: upstreamTimeoutMs })) {
+    if (!Number.isSafeInteger(value) || value < 1 || value > 2_147_483_647) throw new Error(`${name} must be a positive finite integer`);
+  }
 
   if (!offerId) throw new Error('--offer <id> is required');
   if (!model) throw new Error('--model <id> is required (the offer model you serve)');
@@ -100,5 +110,9 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
     settlementAddr,
     payerDenylist,
     maxOutputTokens,
+    trustedProxies,
+    clientIpHeader,
+    maxConcurrentRequests,
+    upstreamTimeoutMs,
   };
 }

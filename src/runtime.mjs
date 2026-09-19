@@ -65,7 +65,7 @@ export async function createRelayRuntime(config) {
   // bridge's forward-to-OpenAI-compatible-upstream guts instead of reimplementing the fetch. The
   // relay's config.upstream is the API ROOT (no /v1); the bridge appends /chat/completions to its
   // baseUrl, so we hand it config.upstream + '/v1' to keep the delivered URL byte-identical.
-  const upstream = httpUpstream({ baseUrl: config.upstream + '/v1', key: config.upstreamKey });
+  const upstream = httpUpstream({ baseUrl: config.upstream + '/v1', key: config.upstreamKey, timeoutMs: config.upstreamTimeoutMs ?? 120_000 });
   const payerDenied = async (payer) => {
     if (!payer) return false; // no verified payer surfaced: nothing to screen
     if (payerDenylist.has(payer)) return true;
@@ -114,8 +114,13 @@ export async function createRelayRuntime(config) {
     }
   };
 
-  const handleDraw = (body, res) =>
-    withBookingLock(String(body?.bookingId ?? ''), async () => {
+  let active = 0;
+  const handleDraw = async (body, res) => {
+    // Bound both distinct booking locks and waiters, including non-HTTP callers.
+    if (active >= (config.maxConcurrentRequests ?? 64)) return send(res, 503, { error: 'relay_busy' });
+    active++;
+    try {
+      return await withBookingLock(String(body?.bookingId ?? ''), async () => {
       await refreshPlatformFeeIfStale(); // #651: track platform fee changes before the fee-floor check
       let out = await core.serve(body);
       // #654 (codex review): a fee DECREASE that landed inside the current TTL window
@@ -128,13 +133,17 @@ export async function createRelayRuntime(config) {
         out = await core.serve(body);
       }
       return send(res, out.status, out.body);
-    });
+      });
+    } finally {
+      active--;
+    }
+  };
 
   return { handleDraw };
 }
 
 async function fetchPlatformConfig(config) {
-  const r = await fetch(config.apiBase + '/api/config');
+  const r = await fetch(config.apiBase + '/api/config', { signal: AbortSignal.timeout(5000) });
   if (!r.ok) throw new Error('config fetch failed: ' + r.status);
   const body = await r.json();
   return {

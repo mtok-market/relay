@@ -282,6 +282,24 @@ export function createServeCore({
       return { status: 402, body: { error: 'contract_mode_required', detail: 'this relay only serves contract-mode draws; the platform is not reporting a dripContractAddress' } };
     }
     if (!drawPaidTxHash) return { status: 402, body: { error: 'draw_payment_required', detail: 'contract mode requires drawPaidTxHash before upstream delivery' } };
+    let storedKey = cacheKey;
+    // The redemption interface may be sync (fs store) or async (a Workers KV
+    // store): await normalizes both, and identity-awaits cost nothing under the
+    // host's per-booking lock.
+    let redemptionState = await redemption.state(storedKey);
+    // Preserve an upgrade's pre-scheme redemption log; missing this alias
+    // would let a legacy paid draw run upstream again after relay upgrade.
+    if (!redemptionState && oldLegacyKey) {
+      const oldLegacyState = await redemption.state(oldLegacyKey);
+      if (oldLegacyState) {
+        storedKey = oldLegacyKey;
+        redemptionState = oldLegacyState;
+      } else {
+        // Checking the legacy marker may have refreshed a prefixed record
+        // appended by another upgraded process.
+        redemptionState = await redemption.state(cacheKey);
+      }
+    }
     let paid;
     try {
       paid = await verifier.verifyDrawPaid(drawPaidTxHash, {
@@ -295,16 +313,15 @@ export function createServeCore({
         requestHash,
         sellerWallet,
         feeRecipient: currentFeeRecipient,
-        // #580: refuse a payment older than the redemption window. The JSONL
-        // payload cache AND the claim markers are both aged out at boot (#600),
-        // so past retention this age bound is the sole replay defense (its
-        // skip-on-unreadable-block residual is named in redemption.mjs). An
-        // honest retry is seconds-to-minutes old, never days.
-        maxPaidAgeMs: redemption.retentionMs,
+        // A known completion spends no new inference. New claims need a verified
+        // age because both payload and claim markers expire after retention.
+        maxPaidAgeMs: redemptionState === 'complete' ? undefined : redemption.retentionMs,
       });
     } catch (e) {
+      if (e.name === 'TimeoutError') return { status: 503, body: { error: 'relay_timeout', _bookingId: bookingId } };
       return { status: 402, body: { error: 'payment_unverified', detail: e.message } };
     }
+    if (paid?.reason === 'payment_age_unavailable') return { status: 503, body: { error: 'payment_age_unavailable', detail: 'payment age could not be verified; retry this same paid draw', _bookingId: bookingId } };
     if (!paid?.ok) return { status: 402, body: { error: 'payment_unverified', detail: paid?.reason || 'unknown' } };
     const expectedFee = configuredFeeAtomic({
       sellerUsdAtomic: paid.event.sellerUsdAtomic,
@@ -326,24 +343,6 @@ export function createServeCore({
       } catch (e) {
         // A broken screen hook fails CLOSED: do not serve on an unscreenable payer.
         return { status: 403, body: { error: 'payer_denied', detail: 'payer screening failed: ' + e.message } };
-      }
-    }
-    let storedKey = cacheKey;
-    // The redemption interface may be sync (fs store) or async (a Workers KV
-    // store): await normalizes both, and identity-awaits cost nothing under the
-    // host's per-booking lock.
-    let redemptionState = await redemption.state(storedKey);
-    // Preserve an upgrade's pre-scheme redemption log; missing this alias
-    // would let a legacy paid draw run upstream again after relay upgrade.
-    if (!redemptionState && oldLegacyKey) {
-      const oldLegacyState = await redemption.state(oldLegacyKey);
-      if (oldLegacyState) {
-        storedKey = oldLegacyKey;
-        redemptionState = oldLegacyState;
-      } else {
-        // Checking the legacy marker may have refreshed a prefixed record
-        // appended by another upgraded process.
-        redemptionState = await redemption.state(cacheKey);
       }
     }
     if (redemptionState === 'complete') return { status: 200, body: await redemption.get(storedKey) };
@@ -388,6 +387,7 @@ export function createServeCore({
     try {
       completion = await upstream(safeRequest);
     } catch (e) {
+      if (e.name === 'TimeoutError') return { status: 503, body: { error: 'relay_timeout', _bookingId: bookingId } };
       return { status: 502, body: { error: 'upstream_error', detail: e.message } };
     }
 
