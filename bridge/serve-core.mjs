@@ -8,7 +8,7 @@
 // payer-screen POLICY stay in the host.
 //
 // The redemption dependency is an INTERFACE the caller passes:
-//   { state(key), get(key), claim(key, markerKey), complete(key, payload), retentionMs }
+//   { state(key, { claimKey }), get(key, { claimKey }), claim(key, markerKey, { paidAtMs }), complete(key, payload), retentionMs }
 // state(key) returns 'pending' | 'complete' | null. claim(key, markerKey) returns false when the
 // draw is already claimed and THROWS when it cannot claim durably (the core then refuses before
 // upstream spend). complete(key, payload) throws when the payload cannot be persisted; the claim
@@ -268,6 +268,7 @@ export function createServeCore({
     // Legacy redemption remains only to honor draws already paid by old SDKs.
     const cacheKey = `${requestHashScheme}:${bookingId}:${n}:${requestHash}`;
     const oldLegacyKey = hasRequestNonce ? null : `${bookingId}:${n}:${requestHash}`;
+    const redemptionContext = { claimKey: cacheKey };
 
     // Contract mode is the ONLY mode (#487): the legacy direct-transfer FUND
     // lane and its /api/bookings/:id balance read are gone. If the platform is
@@ -281,18 +282,18 @@ export function createServeCore({
     // The redemption interface may be sync (fs store) or async (a Workers KV
     // store): await normalizes both, and identity-awaits cost nothing under the
     // host's per-booking lock.
-    let redemptionState = await redemption.state(storedKey);
+    let redemptionState = await redemption.state(storedKey, redemptionContext);
     // Preserve an upgrade's pre-scheme redemption log; missing this alias
     // would let a legacy paid draw run upstream again after relay upgrade.
     if (!redemptionState && oldLegacyKey) {
-      const oldLegacyState = await redemption.state(oldLegacyKey);
+      const oldLegacyState = await redemption.state(oldLegacyKey, redemptionContext);
       if (oldLegacyState) {
         storedKey = oldLegacyKey;
         redemptionState = oldLegacyState;
       } else {
         // Checking the legacy marker may have refreshed a prefixed record
         // appended by another upgraded process.
-        redemptionState = await redemption.state(cacheKey);
+        redemptionState = await redemption.state(cacheKey, redemptionContext);
       }
     }
     let paid;
@@ -332,7 +333,11 @@ export function createServeCore({
         return { status: 403, body: { error: 'payer_denied', detail: 'payer screening failed: ' + e.message } };
       }
     }
-    if (redemptionState === 'complete') return { status: 200, body: await redemption.get(storedKey) };
+    if (redemptionState === 'complete') {
+      const payload = await redemption.get(storedKey, redemptionContext);
+      if (payload == null) return { status: 503, body: { error: 'redemption_unavailable', detail: 'saved completion is no longer readable; retry this same paid draw', _bookingId: bookingId } };
+      return { status: 200, body: payload };
+    }
     if (redemptionState === 'pending') {
       return { status: 409, body: { error: 'draw_pending', detail: 'this paid draw was already claimed; refusing to run upstream again', _bookingId: bookingId } };
     }
@@ -376,7 +381,7 @@ export function createServeCore({
     try {
       // Legacy uses its old unprefixed identity only for the atomic marker so
       // parallel upgraded stores and an existing log converge on one claim.
-      if (!(await redemption.claim(cacheKey, oldLegacyKey ?? cacheKey))) {
+      if (!(await redemption.claim(cacheKey, oldLegacyKey ?? cacheKey, { paidAtMs: paid.paidAtMs }))) {
         return { status: 409, body: { error: 'draw_pending', detail: 'this paid draw was already claimed; refusing to run upstream again', _bookingId: bookingId } };
       }
     } catch (e) {
