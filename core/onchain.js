@@ -277,9 +277,9 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
       // Once redemption records expire, verified payment age is the replay boundary.
       // An unreadable timestamp is retryable uncertainty, never permission to spend.
       const maxAge = Number(maxPaidAgeMs);
+      let paidAtMs = null;
       if (Number.isFinite(maxAge) && maxAge > 0) {
         const bn = matchedLog?.blockNumber ?? got.receipt.blockNumber;
-        let paidAtMs = null;
         if (bn != null) {
           for (let i = 0; i <= receiptRetries; i++) {
             try {
@@ -317,7 +317,7 @@ export function createOnchainVerifier({ rpcUrl, rpcUrls, usdcAddress, expectedCh
         if (!feeTransfer.ok) return { ok: false, reason: 'fee_transfer_' + feeTransfer.reason };
       }
 
-      return { ok: true, event, from: sellerTransfer?.from ?? feeTransfer?.from ?? null };
+      return { ok: true, event, paidAtMs, from: sellerTransfer?.from ?? feeTransfer?.from ?? null };
     },
   };
 }

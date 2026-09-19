@@ -243,11 +243,6 @@ export function createServeCore({
   maxOutputTokens,
 }) {
   const serve = async (body) => {
-    // #651: feeBps/feeRecipient may be getters so a long-running relay tracks a
-    // platform fee change instead of pinning the boot rate (a fee DECREASE with a
-    // stale higher rate would refuse an already-paid draw as fee_amount_too_low).
-    // Resolve once per serve and use the resolved values everywhere below.
-    const currentFeeBps = typeof feeBps === 'function' ? feeBps() : feeBps;
     const currentFeeRecipient = typeof feeRecipient === 'function' ? feeRecipient() : feeRecipient;
     const { bookingId, n, buyerId, request, requestNonce, drawPaidTxHash } = body;
     const hasRequestNonce = Object.hasOwn(body, 'requestNonce');
@@ -313,9 +308,9 @@ export function createServeCore({
         requestHash,
         sellerWallet,
         feeRecipient: currentFeeRecipient,
-        // A known completion spends no new inference. New claims need a verified
+        // A known claim spends no new inference. New claims need a verified
         // age because both payload and claim markers expire after retention.
-        maxPaidAgeMs: redemptionState === 'complete' ? undefined : redemption.retentionMs,
+        maxPaidAgeMs: redemptionState === 'complete' || redemptionState === 'pending' ? undefined : redemption.retentionMs,
       });
     } catch (e) {
       if (e.name === 'TimeoutError') return { status: 503, body: { error: 'relay_timeout', _bookingId: bookingId } };
@@ -323,14 +318,6 @@ export function createServeCore({
     }
     if (paid?.reason === 'payment_age_unavailable') return { status: 503, body: { error: 'payment_age_unavailable', detail: 'payment age could not be verified; retry this same paid draw', _bookingId: bookingId } };
     if (!paid?.ok) return { status: 402, body: { error: 'payment_unverified', detail: paid?.reason || 'unknown' } };
-    const expectedFee = configuredFeeAtomic({
-      sellerUsdAtomic: paid.event.sellerUsdAtomic,
-      feeAddress: currentFeeRecipient,
-      feeBps: currentFeeBps,
-    });
-    if (BigInt(paid.event.feeUsdAtomic || 0) < expectedFee) {
-      return { status: 402, body: { error: 'payment_unverified', detail: 'fee_amount_too_low' } };
-    }
     // Screen the verified payer before spending upstream capacity. The
     // payment already settled on-chain (that money is the buyer's loss);
     // this refuses the SERVICE, which is the only refusal an edge can
@@ -348,6 +335,19 @@ export function createServeCore({
     if (redemptionState === 'complete') return { status: 200, body: await redemption.get(storedKey) };
     if (redemptionState === 'pending') {
       return { status: 409, body: { error: 'draw_pending', detail: 'this paid draw was already claimed; refusing to run upstream again', _bookingId: bookingId } };
+    }
+    // Completed/pending claims already crossed the fee gate and cannot spend
+    // again. New claims use the policy at the verified payment time.
+    let currentFeeBps;
+    try {
+      currentFeeBps = typeof feeBps === 'function' ? await feeBps(paid) : feeBps ?? 0;
+      if (!Number.isSafeInteger(currentFeeBps) || currentFeeBps < 0 || currentFeeBps > 10_000) throw new TypeError('invalid fee rate');
+    } catch {
+      return { status: 503, body: { error: 'fee_policy_unavailable', detail: 'fee policy could not be verified; retry this same paid draw', _bookingId: bookingId } };
+    }
+    const expectedFee = configuredFeeAtomic({ sellerUsdAtomic: paid.event.sellerUsdAtomic, feeAddress: currentFeeRecipient, feeBps: currentFeeBps });
+    if (BigInt(paid.event.feeUsdAtomic || 0) < expectedFee) {
+      return { status: 402, body: { error: 'payment_unverified', detail: 'fee_amount_too_low' } };
     }
     const paidEvent = paid.event;
     const remainingUsd = Number(paid.event.sellerUsdAtomic || 0) / 1e6;
