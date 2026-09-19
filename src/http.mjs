@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { isIP } from 'node:net';
-import { createLimiter } from '../../api/src/core/limiter.js';
+import { createLimiter } from '../core/limiter.js';
 
 export const MAX_BODY_BYTES = 256_000;
 
