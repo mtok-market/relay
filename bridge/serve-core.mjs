@@ -161,24 +161,8 @@ export function configuredFeeAtomic({ sellerUsdAtomic, feeAddress, feeBps }) {
   return (BigInt(sellerUsdAtomic || 0) * bps + 5000n) / 10000n;
 }
 
-// Tokenizer-independent input estimate, byte-aware with a safety margin.
-//
-// #626: this used to count one token per UTF-8 byte, i.e. a true worst-case
-// bound (a tokenizer cannot emit more text tokens than bytes). That bound is
-// correct and roughly 4x too pessimistic for real text, and the over-estimate
-// is NOT free: boundServe refuses a draw whose estimated input cost alone meets
-// the payment, and that refusal happens AFTER the buyer has paid on chain. A
-// real buyer sending a ~4KB prompt on a budget that comfortably covered it was
-// refused every night for two weeks and auto-disputed, silently.
-//
-// So estimate realistically and keep the margin explicit. BYTES_PER_TOKEN_EST
-// of 3.2 is the English average (~4 bytes/token) with ~25% headroom, and
-// staying in BYTES rather than characters keeps multibyte prompts from reading
-// artificially cheap. The seller's residual exposure when an estimate lands
-// low is bounded: actual usage is metered from the upstream response after the
-// serve, and the output cap is computed from whatever budget the input
-// estimate left, so an under-estimate eats into output headroom rather than
-// running unpriced.
+// Legacy buyer estimate. It is not an upper bound and must never authorize
+// inference: digit-dense prompts can consume more than three times this count.
 export const MESSAGE_OVERHEAD_TOKENS = 4;
 export const BYTES_PER_TOKEN_EST = 3.2;
 export function estimateInputTokens(messages) {
@@ -193,33 +177,37 @@ export function estimateInputTokens(messages) {
   return envelope + Math.ceil(bytes / BYTES_PER_TOKEN_EST);
 }
 
-// Bound a serve against the paid budget in BOTH legs (#495/#460). The relay used
-// to cap only OUTPUT, so a dust draw + a huge prompt got its output capped but the
-// whole prompt forwarded, making the seller eat unbounded upstream INPUT compute.
-// Estimate the input cost and REFUSE before any upstream call if it alone meets or
-// exceeds the payment; otherwise cap output over the budget LEFT after input. inPrice
-// and outPrice are USD per MTok. The estimate gates the refuse ONLY; real billing
-// still meters the upstream's reported token counts, so this never over-charges.
-// #654: DEFAULT_MAX_OUTPUT_TOKENS is a generous sanity ceiling, not a money guard
-// (the paid budget below already bounds output, and billing meters real usage). The
-// old 4096 was low enough to cap honest large-output requests below what the buyer
-// funded, so they overpaid. A relay operator can raise or lower it per their upstream
-// (see createServeCore's maxOutputTokens); this default just keeps a no-max_tokens
-// request on a big budget from triggering one runaway generation.
+// Reserve the counted input before output. Prices are atomic USD per million
+// tokens; keeping that denominator until division avoids rounding a fractional
+// input charge away or spending one atomic unit twice. Billing still uses usage.
 export const DEFAULT_MAX_OUTPUT_TOKENS = 32768;
-export function boundServe({ messages, budgetUsd, inPrice, outPrice, reqMax, contextCeil = DEFAULT_MAX_OUTPUT_TOKENS }) {
-  const estIn = estimateInputTokens(messages);
-  const estInCostUsd = estIn * (Number(inPrice) > 0 ? Number(inPrice) : 0) / 1e6;
-  if (estInCostUsd >= budgetUsd) return { refuse: true, reason: 'input', estIn, estInCostUsd };
-  const outBudgetUsd = budgetUsd - estInCostUsd;
+export const DEFAULT_MAX_INPUT_TOKENS = 131072;
+function withinInputLimit(inputTokens, inputCeil) {
+  if (!Number.isSafeInteger(inputTokens) || inputTokens < 0) throw new TypeError('input token count must be a nonnegative safe integer');
+  if (!Number.isSafeInteger(inputCeil) || inputCeil <= 0) throw new TypeError('input token ceiling must be a positive safe integer');
+  return inputTokens <= inputCeil;
+}
+const offerPriceAtomic = value => BigInt(Math.ceil(Number(value) * 1e6));
+
+export function boundServe({ inputTokens, budgetUsdAtomic, inPriceAtomic, outPriceAtomic, reqMax, inputCeil = DEFAULT_MAX_INPUT_TOKENS, contextCeil = DEFAULT_MAX_OUTPUT_TOKENS }) {
+  const inputAllowed = withinInputLimit(inputTokens, inputCeil);
+  if (!Number.isSafeInteger(contextCeil) || contextCeil <= 0) throw new TypeError('output token ceiling must be a positive safe integer');
+  const budget = BigInt(budgetUsdAtomic);
+  const inputPrice = BigInt(inPriceAtomic);
+  const outputPrice = BigInt(outPriceAtomic);
+  if (budget < 0n || inputPrice < 0n || outputPrice < 0n) throw new RangeError('token budget and prices must be nonnegative');
+  const inputCost = BigInt(inputTokens) * inputPrice;
+  const details = { inputTokens, inputCostUsd: Number(inputCost) / 1e12 };
+  if (!inputAllowed) return { refuse: true, reason: 'input_limit', ...details };
+  const outputBudget = budget * 1_000_000n - inputCost;
+  if (outputBudget <= 0n) return { refuse: true, reason: 'input', ...details };
+  if (outputPrice === 0n) return { refuse: true, reason: 'output_price', ...details };
   let maxTok = contextCeil;
   if (Number(reqMax) > 0) maxTok = Math.min(maxTok, Math.floor(Number(reqMax)));
-  if (!Number.isFinite(Number(outPrice)) || Number(outPrice) <= 0) {
-    return { refuse: true, reason: 'output_price', estIn, estInCostUsd };
-  }
-  maxTok = Math.min(maxTok, Math.floor(outBudgetUsd / Number(outPrice) * 1e6));
-  if (maxTok < 1) return { refuse: true, reason: 'output', estIn, estInCostUsd };
-  return { refuse: false, maxTok, estIn, estInCostUsd };
+  const fundedOutput = outputBudget / outputPrice;
+  if (fundedOutput < BigInt(maxTok)) maxTok = Number(fundedOutput);
+  if (maxTok < 1) return { refuse: true, reason: 'output', ...details };
+  return { refuse: false, maxTok, ...details };
 }
 
 // The core factory. `verifier` is an mtok-verify createOnchainVerifier instance (or anything
@@ -235,13 +223,37 @@ export function createServeCore({
   offerId, sellerAgentId, sellerWallet,
   dripContractAddress, feeRecipient, feeBps,
   screenPayer,
+  // The host counts its actual sanitized provider input. Missing or failed
+  // accounting refuses a fresh claim; saved completions do not need recounting.
+  countInputTokens,
+  maxInputTokens = DEFAULT_MAX_INPUT_TOKENS,
   // #654: the output-token sanity ceiling for boundServe. The PAID budget already
   // bounds output (and metering is on real usage), so this is a defensive cap on a
   // single generation, not a money guard. It is a per-relay knob: the reference host
   // passes MTOK_MAX_OUTPUT_TOKENS / a config value; operators serving large-context
   // models raise it. Falls back to boundServe's own generous default when unset.
-  maxOutputTokens,
+  maxOutputTokens = DEFAULT_MAX_OUTPUT_TOKENS,
 }) {
+  const quote = async (request) => {
+    const checked = validateRequest(request, model);
+    if (checked.error) return { status: 400, body: { error: 'bad_request', detail: checked.error } };
+    try {
+      const inputTokens = await countInputTokens(checked.safeRequest);
+      if (!withinInputLimit(inputTokens, maxInputTokens)) return { status: 413, body: { error: 'input_too_large', detail: `input (${inputTokens} tokens) exceeds this relay's input-token limit` } };
+      if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) throw new TypeError('output token ceiling must be a positive safe integer');
+      const inputPrice = offerPriceAtomic(inPrice);
+      const outputPrice = offerPriceAtomic(outPrice);
+      if (inputPrice < 0n || outputPrice <= 0n) throw new RangeError('invalid offer prices');
+      return { status: 200, body: {
+        model, offerId, inputTokens, maxInputTokens, maxOutputTokens,
+        inputPricePerMTokAtomic: inputPrice.toString(),
+        outputPricePerMTokAtomic: outputPrice.toString(),
+      } };
+    } catch (e) {
+      return { status: 503, body: { error: 'input_accounting_unavailable', detail: e.message } };
+    }
+  };
+
   const serve = async (body) => {
     const currentFeeRecipient = typeof feeRecipient === 'function' ? feeRecipient() : feeRecipient;
     const { bookingId, n, buyerId, request, requestNonce, drawPaidTxHash } = body;
@@ -360,21 +372,32 @@ export function createServeCore({
       return { status: 402, body: { error: 'balance_exhausted', detail: `remainingUsd=${remainingUsd}`, _bookingId: bookingId, remainingUsd } };
     }
 
-    // Bound BOTH legs against what the draw paid for (#495/#460). The relay used
-    // to cap only OUTPUT, so a dust draw + a huge prompt got its output capped but
-    // the whole prompt forwarded => the seller ate unbounded upstream INPUT compute.
-    // Now: REFUSE before any upstream call if the estimated input cost alone meets
-    // the payment, else cap output over the budget LEFT after input. Input is priced
-    // at the higher of our offer price and the buyer's committed event price, so the
-    // buyer can't zero the input leg to sneak a big prompt.
-    const eventInPriceUsd = Number(paidEvent.inputPricePerMTokAtomic || 0) / 1e6;
-    const eventOutPriceUsd = Number(paidEvent.outputPricePerMTokAtomic || 0) / 1e6;
-    const boundInPrice = Math.max(Number(inPrice) || 0, eventInPriceUsd);
-    const boundOutPrice = Math.max(Number(outPrice) || 0, eventOutPriceUsd);
-    const bound = boundServe({ messages: checked.safeRequest.messages, budgetUsd: remainingUsd, inPrice: boundInPrice, outPrice: boundOutPrice, reqMax: checked.safeRequest.max_tokens, ...(Number(maxOutputTokens) > 0 ? { contextCeil: Math.floor(Number(maxOutputTokens)) } : {}) });
+    let bound;
+    try {
+      const inputTokens = await countInputTokens(checked.safeRequest);
+      const price = (offered, committed) => {
+        const local = offerPriceAtomic(offered);
+        const paid = BigInt(committed);
+        return local > paid ? local : paid;
+      };
+      bound = boundServe({
+        inputTokens,
+        budgetUsdAtomic: paidEvent.sellerUsdAtomic,
+        inPriceAtomic: price(inPrice, paidEvent.inputPricePerMTokAtomic),
+        outPriceAtomic: price(outPrice, paidEvent.outputPricePerMTokAtomic),
+        reqMax: checked.safeRequest.max_tokens,
+        inputCeil: maxInputTokens,
+        contextCeil: maxOutputTokens,
+      });
+    } catch (e) {
+      return { status: 503, body: { error: 'input_accounting_unavailable', detail: e.message, _bookingId: bookingId } };
+    }
     if (bound.refuse) {
-      const error = bound.reason === 'input' ? 'input_too_large' : 'output_unfunded';
-      return { status: 402, body: { error, detail: `estimated input (~${bound.estIn} tokens, $${bound.estInCostUsd.toFixed(6)}) leaves no safely funded output in the paid amount ($${remainingUsd})`, _bookingId: bookingId, remainingUsd } };
+      const error = bound.reason === 'input' || bound.reason === 'input_limit' ? 'input_too_large' : 'output_unfunded';
+      const detail = bound.reason === 'input_limit'
+        ? `input (${bound.inputTokens} tokens) exceeds this relay's input-token limit`
+        : `input (${bound.inputTokens} tokens, $${bound.inputCostUsd.toFixed(6)}) leaves no safely funded output in the paid amount ($${remainingUsd})`;
+      return { status: 402, body: { error, detail, _bookingId: bookingId, remainingUsd } };
     }
     const safeRequest = { ...checked.safeRequest, model, max_tokens: bound.maxTok };
 
@@ -428,5 +451,5 @@ export function createServeCore({
     return { status: 200, body: payload };
   };
 
-  return { serve };
+  return { serve, quote };
 }

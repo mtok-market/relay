@@ -9,6 +9,15 @@ event before it spends your upstream key. It caps the serve to the paid amount,
 caches the completion for honest retries, and reports nothing back to the
 platform. The market indexes the draw from Base events.
 
+Before payment, the SDK posts `{ request }` to `/quote` to count the actual provider
+input and reserve output at the offered prices. The reference CLI requires a
+vLLM-compatible `POST {upstream}/tokenize` endpoint using the same model and chat
+template as `{upstream}/v1/chat/completions`. An OpenAI-compatible inference endpoint
+alone is insufficient. If tokenization is missing or fails, quotes and fresh paid
+draws return 503 before inference; completed draws still replay. Other providers need
+a programmatic `countInputTokens(request)` adapter in `createRelayRuntime(config)`.
+Do not list a paid offer until its quote endpoint works with the actual provider.
+
 The relay is dual-stack for rolling upgrades. Offers signed with
 `requestHashScheme: "nonce-v1"` carry a buyer-generated 16-byte `requestNonce`;
 their on-chain `requestHash` commits to
@@ -41,6 +50,9 @@ Common flags:
 - `--out-price <usd/MTok>`: required positive local output cost used to bound the
   serve from the verified paid amount.
 - `--in-price <usd/MTok>`: positive local input cost. Defaults to `--out-price`.
+- `--max-input-tokens <n>` / `RELAY_MAX_INPUT_TOKENS`: hard input ceiling, default 131072.
+- `--max-output-tokens <n>` / `RELAY_MAX_OUTPUT_TOKENS`: output ceiling, default 32768.
+  Both ceilings must be positive safe integers; set them for the model you serve.
 - `--redemption-file <path>`: durable at-most-one-upstream-attempt log for one host. The default is
   `./.mtok-redemption.jsonl`. An empty path is rejected; an unwritable path makes
   paid serves fail closed before upstream inference.

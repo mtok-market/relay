@@ -75,6 +75,33 @@ export function httpUpstream({ baseUrl, key, timeoutMs }) {
   };
 }
 
+// The provider owns the chat template. Its tokenization endpoint must use the
+// same model and renderer as /chat/completions; a character estimate cannot
+// replace this call. This is the vLLM TokenizeChatRequest contract.
+export function httpInputCounter({ url, key, timeoutMs = 5000 }) {
+  return async ({ model, messages }) => {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...(key ? { authorization: `Bearer ${key}` } : {}) },
+      body: JSON.stringify({ model, messages, add_generation_prompt: true, add_special_tokens: false }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!response.ok) throw new Error(`upstream tokenization ${response.status}`);
+    // Native tokenizers also return every token ID. Bound that response before
+    // parsing, while allowing a full token array for the relay's 256 KB input.
+    const decoder = new TextDecoder();
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of response.body) {
+      size += chunk.byteLength;
+      if (size > 4 * 1024 * 1024) throw new Error('upstream tokenization response is too large');
+      chunks.push(decoder.decode(chunk, { stream: true }));
+    }
+    chunks.push(decoder.decode());
+    return JSON.parse(chunks.join('')).count;
+  };
+}
+
 // The SECOND upstream mode (#566): a Cloudflare Workers AI binding instead of an HTTP endpoint.
 // `ai` is the Worker's `env.AI` (has `.run(model, { messages, max_tokens })`). Returns the same
 // upstream(payload) contract as httpUpstream, normalizing Workers AI's output (native `{ response,

@@ -2,7 +2,7 @@ import { createRedemptionStore } from './redemption.mjs';
 import { createPostgresRedemptionStore } from './postgres-redemption.mjs';
 import { createOnchainVerifier } from '../core/onchain.js';
 import { normalizeFeeSchedule, paymentFeeBpsAt } from '../core/fee-policy.js';
-import { httpUpstream, createServeCore } from '../bridge/bridge.mjs';
+import { httpUpstream, httpInputCounter, createServeCore } from '../bridge/bridge.mjs';
 import { send } from './http.mjs';
 import { rpcUrlsFor } from './rpc.mjs';
 
@@ -66,6 +66,7 @@ export async function createRelayRuntime(config) {
   // relay's config.upstream is the API ROOT (no /v1); the bridge appends /chat/completions to its
   // baseUrl, so we hand it config.upstream + '/v1' to keep the delivered URL byte-identical.
   const upstream = httpUpstream({ baseUrl: config.upstream + '/v1', key: config.upstreamKey, timeoutMs: config.upstreamTimeoutMs ?? 120_000 });
+  const countInputTokens = config.countInputTokens ?? httpInputCounter({ url: config.upstream + '/tokenize', key: config.upstreamKey });
   const payerDenied = async (payer) => {
     if (!payer) return false; // no verified payer surfaced: nothing to screen
     if (payerDenylist.has(payer)) return true;
@@ -96,6 +97,8 @@ export async function createRelayRuntime(config) {
     },
     // #654: per-relay output sanity ceiling (unset => the shared generous default).
     maxOutputTokens: config.maxOutputTokens,
+    maxInputTokens: config.maxInputTokens,
+    countInputTokens,
     screenPayer: payerDenied,
   });
 
@@ -140,7 +143,18 @@ export async function createRelayRuntime(config) {
     }
   };
 
-  return { handleDraw, close: () => served.close?.() };
+  const handleQuote = async (body, res) => {
+    if (active >= (config.maxConcurrentRequests ?? 64)) return send(res, 503, { error: 'relay_busy' });
+    active++;
+    try {
+      const out = await core.quote(body.request);
+      return send(res, out.status, out.body);
+    } finally {
+      active--;
+    }
+  };
+
+  return { handleDraw, handleQuote, close: () => served.close?.() };
 }
 
 async function fetchPlatformConfig(config) {

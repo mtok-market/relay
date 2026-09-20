@@ -73,7 +73,7 @@ export function clientRateKey(req, trustedProxies = new Set(), header = 'cf-conn
   return words.slice(0, 4).map(word => word.padStart(4, '0')).join(':') + '::/64';
 }
 
-export function startRelayServer({ config, handleDraw }) {
+export function startRelayServer({ config, handleDraw, handleQuote }) {
   const callers = createLimiter({ max: config.maxRequestsPerMinute ?? 120 });
   const aggregate = createLimiter({ max: config.maxTotalRequestsPerMinute ?? 1200 });
   const trustedProxies = new Set((config.trustedProxies ?? []).map(canonicalIp).filter(Boolean));
@@ -87,7 +87,7 @@ export function startRelayServer({ config, handleDraw }) {
       res.once('finish', () => req.destroy());
       send(res, status, { error });
     };
-    if (req.method !== 'POST' || req.url !== '/chunk') {
+    if (req.method !== 'POST' || !['/chunk', '/quote'].includes(req.url)) {
       return refuse(404, 'not found');
     }
     try {
@@ -109,7 +109,7 @@ export function startRelayServer({ config, handleDraw }) {
       if (body?.request == null) {
         return send(res, 400, { error: 'bad_request', detail: 'need a DRAW (request); the legacy FUND lane is retired, pay per draw on-chain' });
       }
-      await handleDraw(body, res);
+      await (req.url === '/quote' ? handleQuote : handleDraw)(body, res);
     } catch (error) {
       (config.log ?? console).error?.(`mtok relay: request failed (${error.message})`);
       refuse(503, 'relay_unavailable');

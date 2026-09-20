@@ -56,8 +56,13 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   // the shared generous default in mtok-bridge's boundServe.
   const maxOutputRaw = flag(argv, '--max-output-tokens') ?? env.RELAY_MAX_OUTPUT_TOKENS;
   const maxOutputTokens = maxOutputRaw != null ? Number(maxOutputRaw) : undefined;
-  if (maxOutputTokens != null && (!Number.isFinite(maxOutputTokens) || maxOutputTokens < 1)) {
-    throw new Error('--max-output-tokens must be a positive integer');
+  if (maxOutputTokens != null && (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1)) {
+    throw new Error('--max-output-tokens must be a positive safe integer');
+  }
+  const maxInputRaw = flag(argv, '--max-input-tokens') ?? env.RELAY_MAX_INPUT_TOKENS;
+  const maxInputTokens = maxInputRaw != null ? Number(maxInputRaw) : undefined;
+  if (maxInputTokens != null && (!Number.isSafeInteger(maxInputTokens) || maxInputTokens < 1)) {
+    throw new Error('--max-input-tokens must be a positive safe integer');
   }
   const trustedProxies = String(env.RELAY_TRUSTED_PROXIES ?? '').split(',').map(value => value.trim()).filter(Boolean);
   if (trustedProxies.some(value => !isIP(value) || value.includes('%'))) throw new Error('RELAY_TRUSTED_PROXIES must contain exact IP addresses');
@@ -118,6 +123,7 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
     settlementAddr,
     payerDenylist,
     maxOutputTokens,
+    maxInputTokens,
     trustedProxies,
     clientIpHeader,
     maxConcurrentRequests,
