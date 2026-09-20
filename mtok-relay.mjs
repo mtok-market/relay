@@ -23,15 +23,32 @@
 //   restarts, with no flag needed (the default is ./.mtok-redemption.jsonl in the working dir).
 //   Override the path with --redemption-file / RELAY_REDEMPTION_FILE. An empty or unwritable
 //   path is rejected or fails closed before upstream spend.
+//   Replicas on separate hosts use one RELAY_REDEMPTION_DATABASE_URL (PostgreSQL).
+//   Migrate stopped file writers with `mtok-relay import-redemptions <file>...`.
 
 import { readRelayConfig } from './src/config.mjs';
 import { startRelayServer } from './src/http.mjs';
 import { createRelayRuntime } from './src/runtime.mjs';
+import { createPostgresRedemptionStore } from './src/postgres-redemption.mjs';
+import { importRedemptionFiles } from './src/import-redemptions.mjs';
 
 try {
-  const config = readRelayConfig();
-  const runtime = await createRelayRuntime(config);
-  startRelayServer({ config, ...runtime });
+  if (process.argv[2] === 'import-redemptions') {
+    const files = process.argv.slice(3);
+    if (!files.length || !process.env.RELAY_REDEMPTION_DATABASE_URL) {
+      throw new Error('import-redemptions needs one or more JSONL paths and RELAY_REDEMPTION_DATABASE_URL');
+    }
+    const store = await createPostgresRedemptionStore({ url: process.env.RELAY_REDEMPTION_DATABASE_URL });
+    try {
+      const count = await importRedemptionFiles(store, files);
+      console.log(`mtok-relay: imported ${count} redemption records and markers`);
+    } finally { await store.close(); }
+  } else {
+    const config = readRelayConfig();
+    const runtime = await createRelayRuntime(config);
+    const server = startRelayServer({ config, ...runtime });
+    server.on('close', () => runtime.close());
+  }
 } catch (e) {
   console.error('mtok-relay: boot failed -', e.message);
   process.exit(1);

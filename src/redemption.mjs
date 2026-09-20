@@ -5,11 +5,13 @@ import crypto from 'node:crypto';
 // may attempt upstream at most once, and an honest retry (a lost 200) replays the same
 // completion without re-running upstream. The house relay does this with Cloudflare
 // KV, but `npx mtok-relay` is a plain node process with no KV, so the money guard has
-// to survive a restart on its own: a local append-only JSONL log (drawKey -> {at,
+// to survive a restart on one host: a local append-only JSONL log (drawKey -> {at,
 // state, payload?}), loaded + pruned-by-age on boot, appended on each serve. Without a
 // writable path it fails closed before upstream spend. A pending claim is written
 // before inference; completion appends a second record. A crash or post-spend error
 // therefore leaves a durable pending record which cannot run upstream again.
+// Separate disks need the shared PostgreSQL store in postgres-redemption.mjs;
+// local exclusive markers cannot coordinate hosts with independent filesystems.
 //
 // Retention (default 7d) bounds the JSONL log: an honest retry is seconds-to-minutes old,
 // so a replay a week after payment is not a real retry. There is no mid-session

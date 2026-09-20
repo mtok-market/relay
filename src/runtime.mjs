@@ -1,4 +1,5 @@
 import { createRedemptionStore } from './redemption.mjs';
+import { createPostgresRedemptionStore } from './postgres-redemption.mjs';
 import { createOnchainVerifier } from '../core/onchain.js';
 import { normalizeFeeSchedule, paymentFeeBpsAt } from '../core/fee-policy.js';
 import { httpUpstream, createServeCore } from '../bridge/bridge.mjs';
@@ -9,8 +10,8 @@ export async function createRelayRuntime(config) {
   // Durable redemption (#495): a paid request attempts upstream at most once and
   // a completed honest retry replays the stored completion, across restarts. verifyDrawPaid is a permanent
   // chain read that consumes nothing, so this store -- NOT a TTL cache -- is the
-  // one-serve-per-payment guard. See src/redemption.mjs for the durability model.
-  const served = createRedemptionStore({ file: config.redemptionFile, log: config.log });
+  // one-serve-per-payment guard. Replicas on separate hosts use one PostgreSQL
+  // database; the file store coordinates only processes sharing its filesystem.
   const drawLocks = new Map();
   const platform = await fetchPlatformConfig(config);
   // Refresh activation history at least once a minute for NEW claims. A failed
@@ -45,6 +46,9 @@ export async function createRelayRuntime(config) {
   // Base. platform.chainId is the /config-declared chain; pin to it and fail closed on mismatch.
   const verifier = createOnchainVerifier({ rpcUrls: rpcUrlsFor(platform.chainId, config.rpcFlag), usdcAddress: platform.usdcAddress, expectedChainId: platform.chainId });
   if (!verifier.configured) throw new Error('onchain verifier not configured (missing usdcAddress in /api/config)');
+  const served = config.redemptionDatabaseUrl
+    ? await createPostgresRedemptionStore({ url: config.redemptionDatabaseUrl })
+    : createRedemptionStore({ file: config.redemptionFile, log: config.log });
 
   // Payer screen for contract-mode draws (gates-to-classifiers groundwork,
   // #387): the platform can no longer refuse money that
@@ -136,7 +140,7 @@ export async function createRelayRuntime(config) {
     }
   };
 
-  return { handleDraw };
+  return { handleDraw, close: () => served.close?.() };
 }
 
 async function fetchPlatformConfig(config) {

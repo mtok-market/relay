@@ -33,6 +33,13 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
   const redemptionFlag = flag(argv, '--redemption-file') ?? env.RELAY_REDEMPTION_FILE;
   if (redemptionFlag === '') throw new Error('--redemption-file cannot be empty; paid serves require durable redemption');
   const redemptionFile = redemptionFlag === undefined ? './.mtok-redemption.jsonl' : redemptionFlag;
+  const redemptionDatabaseUrl = env.RELAY_REDEMPTION_DATABASE_URL;
+  if (redemptionDatabaseUrl !== undefined) {
+    if (!['postgres:', 'postgresql:'].includes(new URL(redemptionDatabaseUrl).protocol)) {
+      throw new Error('RELAY_REDEMPTION_DATABASE_URL must use PostgreSQL');
+    }
+    if (redemptionFlag !== undefined) throw new Error('choose PostgreSQL or a redemption file, not both');
+  }
   // Optional payer screen for the contract-mode serve path (gates-to-classifiers
   // groundwork, #387): a comma-separated list of wallet
   // addresses this relay refuses to serve, checked against the VERIFIED DrawPaid
@@ -105,6 +112,7 @@ export function readRelayConfig({ argv = process.argv.slice(2), env = process.en
     outPrice,
     inPrice,
     redemptionFile,
+    redemptionDatabaseUrl,
     mtokApiKey,
     upstreamKey,
     settlementAddr,
