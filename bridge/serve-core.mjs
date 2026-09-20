@@ -223,6 +223,9 @@ export function createServeCore({
   offerId, sellerAgentId, sellerWallet,
   dripContractAddress, feeRecipient, feeBps,
   screenPayer,
+  // A retired payment domain may honor verified receipts without admitting
+  // quotes or another inference attempt for an unrecorded payment.
+  replayOnly = false,
   // The host counts its actual sanitized provider input. Missing or failed
   // accounting refuses a fresh claim; saved completions do not need recounting.
   countInputTokens,
@@ -235,6 +238,7 @@ export function createServeCore({
   maxOutputTokens = DEFAULT_MAX_OUTPUT_TOKENS,
 }) {
   const quote = async (request) => {
+    if (replayOnly) return { status: 503, body: { error: 'redemption_unavailable', detail: 'this relay only replays saved completions' } };
     const checked = validateRequest(request, model);
     if (checked.error) return { status: 400, body: { error: 'bad_request', detail: checked.error } };
     try {
@@ -352,6 +356,9 @@ export function createServeCore({
     }
     if (redemptionState === 'pending') {
       return { status: 409, body: { error: 'draw_pending', detail: 'this paid draw was already claimed; refusing to run upstream again', _bookingId: bookingId } };
+    }
+    if (replayOnly) {
+      return { status: 503, body: { error: 'redemption_unavailable', detail: 'this payment has no saved completion; retry this same paid draw after reconciliation', _bookingId: bookingId } };
     }
     // Completed/pending claims already crossed the fee gate and cannot spend
     // again. New claims use the policy at the verified payment time.
